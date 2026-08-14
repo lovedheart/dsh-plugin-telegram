@@ -1,0 +1,29 @@
+- insert:
+    - id: telegram
+      name: '/home/lovedheart/Documents/dsh-plugin-telegram/lib/index.js'
+      config:
+        # Token 可以不填，通过环境变量 TELEGRAM_BOT_TOKEN 传入
+        # botToken: 'YOUR_BOT_TOKEN'
+        # 或者设置环境变量: export TELEGRAM_BOT_TOKEN='your_token'
+        # Optional: base URL for self-hosted Telegram API
+        # baseUrl: 'https://tg.local-bot-api.domain.com'
+        # Default chat ID to send messages to when none is specified
+        defaultChatId: 'YOUR_CHAT_ID'
+        # Allowed chat IDs (empty = allow all)
+        allowedChats: []
+        # Allowed user IDs (empty = allow all)
+        allowedUsers: []
+        # Require @mention in group chats before responding
+        requireMention: false
+        # Enable long-polling for incoming messages
+        pollingEnabled: true
+        # Long-polling timeout in seconds
+        longPollTimeout: 30
+        # Parse mode for outgoing messages
+        parseMode: 'HTML'
+        # Agent integration: inject Telegram messages to agent loop
+        injectToAgent: true
+        # Response mode: 'tool' (agent uses telegram_send_message) or 'direct' (direct reply)
+        agentResponseMode: 'tool'
+        # Optional prefix for agent's responses
+        replyPrefix: ''
