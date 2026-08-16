@@ -125,7 +125,7 @@ dsh web --patch ./cordis.yml
 | `injectToAgent` | boolean | `true` | Inject messages to agent loop |
 | `agentResponseMode` | string | `"tool"` | Response mode: `'tool'` or `'direct'` |
 | `replyPrefix` | string | `""` | Optional prefix for agent responses |
-| `directReplyTimeoutSec` | number | `3600` | (direct mode) Max seconds to wait for a turn's final reply before giving up on auto-forward. Long tool-call turns can run many minutes; short replies are still forwarded in seconds — this is only the cap. |
+| `directReplyTimeoutSec` | number | `3600` | (direct mode) Absolute safety cap (seconds) for the reply-forward watcher. The watcher is busy-aware — it follows the agent while it runs (long tool-call turns are fine) and forwards the reply the moment the agent goes idle with a fresh message; this cap only bounds pathological hangs. Short replies are still forwarded within seconds. |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
 
 ## Creating a Telegram Bot

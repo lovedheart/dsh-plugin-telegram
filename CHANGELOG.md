@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.8] - 2026-08-16
+
+### Changed
+- **`watchDirectReply` is now busy-aware** (hardening the 0.3.7 fix):
+  previously the loop was a blind "poll until idle-with-reply, up to the cap".
+  Now it follows the agent's live `status` (dsh-agent-loop `get status()`):
+  - while the agent is `running` it keeps waiting (long multi-tool-call
+    turns, the 0.3.7 root cause, no longer race a fixed wall-clock window);
+  - the instant it is not running with a fresh assistant message → forward
+    it (short replies still go out within seconds);
+  - if it goes quiet with nothing forwardable **after a short 15 s grace**,
+    it stops instead of idling until the cap — the grace is gated on having
+    seen the turn run, so the pre-start idle window is never mistaken for
+    "done".
+  - `directReplyTimeoutSec` (default 1 h) is now an **absolute safety cap**
+    for pathological hangs only, never a per-turn timeout.
+
 ## [0.3.7] - 2026-08-16
 
 ### Fixed
