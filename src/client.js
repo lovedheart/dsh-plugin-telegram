@@ -15,10 +15,18 @@ const DEFAULT_LONG_POLL_TIMEOUT = 30;
 // ---------------------------------------------------------------------------
 
 export class TelegramApiError extends Error {
-  constructor(message, details) {
+  /**
+   * @param message human-readable error message.
+   * @param details raw response body / diagnostic string.
+   * @param status HTTP status code, when the failure was an HTTP response.
+   * @param errorCode Telegram `error_code`, when present in the JSON body.
+   */
+  constructor(message, details, status, errorCode) {
     super(message);
     this.name = 'TelegramApiError';
     this.details = details;
+    this.status = status;
+    this.errorCode = errorCode;
   }
 }
 
@@ -45,10 +53,19 @@ async function tgFetch(baseUrl, botToken, method, body, signal) {
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
-    throw new TelegramApiError(
-      `Telegram API ${method} failed: ${resp.status} ${resp.statusText}`,
-      text
-    );
+    // Telegram error bodies are JSON: {"ok":false,"error_code":N,"description":
+    // "...","parameters":{"retry_after":S}}. Parse them so the poller can
+    // distinguish rate limits (429) and conflicts (409) from other failures.
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+    const errorCode = parsed && typeof parsed.error_code === 'number' ? parsed.error_code : undefined;
+    const description = parsed && parsed.description ? parsed.description : `${resp.status} ${resp.statusText}`;
+
+    if (errorCode === 429 || resp.status === 429) {
+      const retryAfter = parsed?.parameters?.retry_after;
+      throw new TelegramRateLimitError(Number(retryAfter) > 0 ? Number(retryAfter) : 5);
+    }
+    throw new TelegramApiError(`Telegram API ${method} failed: ${description}`, text, resp.status, errorCode);
   }
 
   return resp.json();
@@ -206,6 +223,18 @@ export class TelegramClient {
       editedMessage: u.edited_message ? this._parseMessage(u.edited_message) : undefined,
       callbackQuery: u.callback_query ? this._parseCallbackQuery(u.callback_query) : undefined,
     }));
+  }
+
+  /**
+   * Register the bot's command menu (Telegram Bot API setMyCommands).
+   * After this, Telegram clients show the commands in the / autocomplete
+   * menu. commands: [{command, description}] (command has no leading slash).
+   */
+  async setMyCommands(commands) {
+    await tgFetchOk(this.baseUrl, this.botToken, 'setMyCommands', {
+      commands: commands.map((c) => ({ command: c.command, description: c.description })),
+    });
+    return true;
   }
 
   // ---- Chat action --------------------------------------------------------

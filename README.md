@@ -27,6 +27,32 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `telegram_delete_message` | Delete a message |
 | `telegram_get_info` | Get bot info and config status |
 | `telegram_get_updates` | Manually poll for new updates |
+| `telegram_get_last_assistant_message` | Read the latest assistant message of the current session (debug/test helper) |
+
+### Telegram 会话管理命令（直接发给 bot）
+
+参考 QwenPaw 的命令风格实现：
+
+| 命令 | 作用 |
+|---|---|
+| `/new` 或 `/clear` | 新建会话并路由过去（清空上下文；若当前会话在运行会先停止） |
+| `/sessions` | 列出活动会话（👉=当前，🏠=默认），含状态和模型 |
+| `/use <id>` | 切换到指定会话（支持短 id 前缀匹配） |
+| `/stop` | 停止当前会话正在执行的任务 |
+| `/compact` | 压缩当前会话历史为摘要（走 DSH compaction 服务） |
+| `/history [n]` | 查看最近 n 条对话（默认 12） |
+| `/model` | 查看当前会话的模型 |
+| `/model list` | 列出可用 provider/model |
+| `/model <provider>:<model>` | 为当前会话切换模型（下一轮请求生效） |
+| `/start` 或 `/help` | 显示帮助 |
+
+普通消息路由到当前聊天的 active 会话；无显式路由时落到默认（第一个）会话。
+`/new` 创建的会话继承默认会话的工作目录（`cwd`）与模型（`provider`/`model`，
+来自 `agent.options`），避免 `deployment:persona` 段 `{{cwd}}`/`{{model}}`
+prompt 变量缺失，随插件卸载一起销毁。
+
+命令菜单在 poller 启动时通过 Bot API `setMyCommands` 注册，Telegram 客户端
+输入 `/` 即可看到全部命令的自动补全。
 
 ## Installation
 
@@ -34,11 +60,14 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 
 **方式一：DSH Credentials 系统（推荐，最安全）**
 
-通过 DSH Web UI 的 Models/Credentials 页面设置，或使用命令行：
-```bash
-# 写入 $DSH_HOME/.credentials.yaml（权限 0600，只有所有者可读）
-dsh credential set TELEGRAM_BOT_TOKEN '你的token'
+编辑 `$DSH_HOME/.credentials.yaml`（权限 0600，只有所有者可读）。
+该文件是顶层 YAML mapping：key 为凭据引用名，value 为字符串（建议加引号）：
+```yaml
+TELEGRAM_BOT_TOKEN: "你的token"
 ```
+也可在 DSH Web UI 的 Credentials 设置页写入。插件启动时通过
+`ctx.credentials.resolve('TELEGRAM_BOT_TOKEN')` 读取。
+> 注：DSH 没有 `dsh credential set` 子命令。
 
 **方式二：环境变量**
 
@@ -214,13 +243,17 @@ dsh-plugin-telegram/
 ├── package.json        # Package metadata
 ├── README.md           # This file
 ├── src/
-│   ├── index.js        # Main plugin entry (tools + polling setup)
+│   ├── index.js        # Main plugin entry (tools + polling + agent injection)
 │   ├── client.js       # Telegram Bot API HTTP client
-│   └── poller.js       # Long-polling background service
-└── lib/                # Built output (copy of src/)
+│   ├── poller.js       # Long-polling background service
+│   └── text.js         # Pure text helpers (Markdown→HTML, fence-aware chunking)
+├── test/
+│   └── text.test.mjs   # Unit tests for the pure text helpers (npm test)
+└── lib/                # Built output (copy of src/; `npm run prepare`)
     ├── index.js
     ├── client.js
-    └── poller.js
+    ├── poller.js
+    └── text.js
 ```
 
 ## References
