@@ -44,6 +44,7 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `/model` | 查看当前会话的模型 |
 | `/model list` | 列出可用 provider/model |
 | `/model <provider>:<model>` | 为当前会话切换模型（下一轮请求生效） |
+| `/approval` | 查看已记住的「一直允许」授权（`/approval clear` 清空全部，`/approval <ruleKey>` 清单条） |
 | `/start` 或 `/help` | 显示帮助 |
 
 普通消息路由到当前聊天的 active 会话；无显式路由时落到默认（第一个）会话。
@@ -131,9 +132,10 @@ dsh web --patch ./cordis.yml
 | `progressIntervalMs` | number | `1200` | Minimum gap between in-place edits (Telegram rate-limits edits to ~1/s per message). |
 | `progressTailChars` | number | `240` | Max chars of the thinking/reply tail shown in the indicator. |
 | `progressTimeoutSec` | number | `3600` | Absolute cap before the indicator self-cleans (pathological hangs only). |
-| `approvalEnabled` | boolean | `true` | When the agent's permission policy is `ask` and a tool call needs a decision (e.g. a sandbox escalation), post an inline-keyboard approval card (✅ 批准 / ❌ 拒绝) to the owning chat instead of failing closed. See "Tool-guard approval" below. |
+| `approvalEnabled` | boolean | `true` | When the agent's permission policy is `ask` and a tool call needs a decision (e.g. a sandbox escalation), post an inline-keyboard approval card (✅ 批准 / 🔁 一直允许 / ❌ 拒绝) to the owning chat instead of failing closed. See "Tool-guard approval" below. |
 | `approvalTimeoutSec` | number | `1800` | How long an approval card waits for a tap before expiring (`cancelled`). `0` = no expiry. |
 | `approvalForDefaultAgent` | boolean | `true` | Also surface asks from the deployment's **shared default agent** to the phone. Before `/new`, a plain Telegram message routes to that agent, so this is what makes the card appear in the state you usually test in. Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
+| `approvalAlwaysPath` | string | `''` | File where "🔁 一直允许" remembers are persisted (defaults to `$DSH_HOME/telegram-approval-always.json`). Set an absolute path to relocate. |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
 
 ### Progress indicator (tool calls + thinking)
@@ -175,6 +177,27 @@ release adds one, modelled on QwenPaw's `tool_guard` card:
   A timeout (`approvalTimeoutSec`), a turn abort, or an unload resolves it as
   `cancelled`. The card is edited in place to show the outcome and the button
   click is acked.
+
+#### Allow always (🔁 一直允许)
+
+DSH's approval service has no native "allow always" — the only grant it knows is
+a one-shot `allowed-once`. This plugin adds it on top:
+
+- The card carries a third button **🔁 一直允许** (approve-and-remember). Tapping
+  it grants the current ask **and** remembers a stable rule key for that kind of
+  ask. Matching future asks are then **auto-approved without posting a card**.
+- Rule keys are normalized so a repeated ask maps to the same key even though the
+  free-text reason changes: a sandbox escalation (`escalate sandbox to <mode>: …`)
+  keys on `<tool>:<mode>` → `sandbox:<tool>:<mode>`; any other guarded ask keys on
+  the whole tool → `tool:<name>`.
+- Remembers persist to `$DSH_HOME/telegram-approval-always.json` (atomic write,
+  survives a plugin reload). Manage them with the **`/approval`** command:
+  `/approval` lists remembered rules, `/approval clear` clears all, and
+  `/approval <ruleKey>` clears one by its exact key.
+
+> ⚠️ "Always" is broad — a `sandbox:<tool>:<mode>` rule auto-approves every future
+> escalation to that mode for the owning chat until you clear it. Use it for
+> rules you genuinely want to stop being asked about.
 
 Set `approvalEnabled: false` to turn it off entirely. If the card cannot be
 delivered the request is delegated (to the web UI, or it fails closed) — it is

@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2026-08-16
+
+### Added
+- **"Allow always" (🔁 一直允许) on the approval card**
+  — DSH's approval service has no native "allow always" primitive (its outcome
+  vocabulary is `allowed-once | rejected | cancelled | unavailable`, and its
+  policy is only `ask | never`), so the "always" is implemented plugin-side:
+  - The card gains a third button **🔁 一直允许** (approve-and-remember). Tapping
+    it grants the current ask **and** remembers a stable rule key for that kind
+    of ask; the resolved card notes the rule was remembered.
+  - Matching future asks are **auto-approved without posting a card** until the
+    rule is cleared.
+  - Rule keys are normalized: a sandbox escalation (`escalate sandbox to
+    <mode>: <justification>`) keys on the stable `<tool>:<mode>` pair (the free
+    justification changes per call) → `sandbox:<tool>:<mode>`; any other guarded
+    ask keys on the whole tool → `tool:<name>`.
+  - Remembers are **persisted** to a JSON file (atomic tmp+rename, survives a
+    plugin reload) under `$DSH_HOME/telegram-approval-always.json` (relocatable
+    via the new `approvalAlwaysPath` config key).
+- **`/approval` command** — list remembered rules (`/approval`), clear all
+  (`/approval clear`), or clear one by its exact key (`/approval <ruleKey>`).
+  Registered in the bot command menu and documented in `/help`.
+
+### Changed
+- Approval callback prefix bumped `tgapv:` → `tgapv2:` so a card still open
+  across a plugin upgrade (with only the old two buttons) is not mis-routed;
+  such a card simply expires via its timeout.
+
+### Tests
+- `npm test` now **72 items** (approval 21 → 34): rule-key normalization,
+  describeRuleKey, the allowlist store (check/remember/clear/persist/reload/
+  corrupt-file/chat filtering), and the always-flow (remembered rule auto-
+  approves with no card; the always button remembers; a plain approve stays
+  one-shot).
+
 ## [0.4.1] - 2026-08-16
 
 ### Added
