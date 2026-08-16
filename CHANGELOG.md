@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.3] - 2026-08-16
+
+### Changed
+- **Live trajectory on Telegram (QwenPaw-style edit-in-place streaming)**
+  — the v0.4.0 progress indicator showed only a single "what's happening now"
+  line. It is now a **rolling trail of the agent's recent activity**, edited in
+  place (throttled) and tail-truncated so the newest items stay visible:
+  - Each recent item is one line: `💭 <reasoning 片段>` (streamed as the model
+    thinks) and `🔧 <tool>：<参数预览>` (each tool call, name + compact args).
+  - The whole message is capped at `progressMaxChars` (default 1500); each line
+    is separately capped at `progressPerBlockChars` (default 240).
+  - Tool calls are deduped by `callId` (a tool is shown once, not twice from
+    the streaming `block-end` + the authoritative `tool/call`).
+  - The **final reply is not shown** in the trajectory — it is sent as its own
+    message at turn end, as before.
+  - The indicator now consumes the live `assistant/chunk` events
+    (`reasoning-delta` / `block-end`) in addition to `tool/call`, and still
+    understands the packed `*-chunks` rows for robustness.
+- Config keys: `progressTailChars` → **`progressPerBlockChars`**, and new
+  **`progressMaxChars`**. (`progressEnabled` / `progressDelaySec` /
+  `progressIntervalMs` / `progressTimeoutSec` unchanged.)
+
+### Tests
+- `npm test` now **77 items** (progress 18): rolling-trail rendering, per-line
+  and whole-message truncation, tool dedup, reply exclusion, watermark
+  idempotency, packed-row handling, and the full lifecycle.
+
 ## [0.4.2] - 2026-08-16
 
 ### Added

@@ -1,7 +1,7 @@
 // Unit tests for the Telegram progress indicator (tool calls + thinking).
 // Run: node test/progress.test.mjs
 import { strict as assert } from 'node:assert';
-import { summarizeToolArgs, tailOf, ProgressIndicator } from '../src/index.js';
+import { summarizeToolArgs, tailOf, compactText, ProgressIndicator } from '../src/index.js';
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -41,9 +41,10 @@ function makeOpts(overrides = {}) {
     startedAt: Date.now(),
     client: makeClient(),
     log: () => {},
-    delayMs: 0,          // post immediately in tests
-    intervalMs: 4000,    // large so manual push() is not throttled unexpectedly
-    tailChars: 40,
+    delayMs: 0,             // post immediately in tests
+    intervalMs: 4000,       // large so manual push() is not throttled unexpectedly
+    perBlockChars: 40,
+    maxChars: 200,
     timeoutMs: 60_000,
   }, overrides);
 }
@@ -75,114 +76,102 @@ await test('long string -> ellipsis + tail', () => {
   assert.equal(s.length, 41);
 });
 
-// ---- buildStatusLine priority ---------------------------------------------
-console.log('buildStatusLine:');
-await test('default line when idle', () => {
-  const ind = new ProgressIndicator(makeOpts());
-  assert.equal(ind.buildStatusLine(), '⏳ 正在处理，请稍候…');
+// ---- compactText / buildTraceText -----------------------------------------
+console.log('compactText:');
+await test('collapses whitespace runs', () => {
+  assert.equal(compactText('  a   b\n\nc  '), 'a b c');
+  assert.equal(compactText(undefined), '');
 });
-await test('thinking shown when reasoning is the latest activity', () => {
+
+console.log('buildTraceText:');
+await test('header + neutral line when idle', () => {
   const ind = new ProgressIndicator(makeOpts());
-  ind.lastKind = 'reasoning';
-  ind.reasoningBuf = 'let me think about it a lot';
-  assert.ok(ind.buildStatusLine().includes('💭 思考中'));
+  assert.ok(ind.buildTraceText().includes('📜 运行轨迹'));
+  assert.ok(ind.buildTraceText().includes('⏳ 正在处理，请稍候…'));
 });
-await test('tool shown when tool is the latest activity', () => {
-  const ind = new ProgressIndicator(makeOpts());
-  ind.lastKind = 'tool';
-  ind.currentTool = { name: 'bash', args: '{"command":"ls -la /home"}' };
-  const line = ind.buildStatusLine();
-  assert.ok(line.includes('🔧 正在调用工具 bash'));
-  assert.ok(line.includes('ls -la /home'));
+await test('reasoning streamed into a 💭 line (tail-truncated per block)', () => {
+  const ind = new ProgressIndicator(makeOpts({ perBlockChars: 10 }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'thinking a little ' } } });
+  ind.processEvent({ seq: 2, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'then more' } } });
+  const text = ind.buildTraceText();
+  assert.ok(text.includes('💭'));
+  assert.ok(text.includes('then more'), `expected tail of reasoning, got: ${text}`);
 });
-await test('reply shown when reply is the latest activity', () => {
-  const ind = new ProgressIndicator(makeOpts());
-  ind.lastKind = 'text';
-  ind.replyBuf = 'and this is the answer'.repeat(3);
-  assert.ok(ind.buildStatusLine().includes('✍️ 正在写回复'));
+await test('tool call shown as 🔧 name：args', () => {
+  const ind = new ProgressIndicator(makeOpts({ perBlockChars: 100 }));
+  ind.processEvent({ seq: 1, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la /home"}', callId: 'c1' } });
+  const text = ind.buildTraceText();
+  assert.ok(text.includes('🔧 bash'));
+  assert.ok(text.includes('ls -la /home'));
 });
-await test('most-recent activity wins over earlier thinking (no stale 💭)', () => {
+await test('block-end tool-call and tool/call dedupe by id (not shown twice)', () => {
   const ind = new ProgressIndicator(makeOpts());
-  ind.lastKind = 'reasoning';
-  ind.reasoningBuf = 'some thinking';
-  // Model finished thinking and started the reply.
-  ind.lastKind = 'text';
-  ind.replyBuf = 'the final answer text';
-  const line = ind.buildStatusLine();
-  assert.ok(line.includes('✍️ 正在写回复'), `expected reply line, got: ${line}`);
-  assert.ok(!line.includes('💭 思考中'), 'stale thinking must not be shown');
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{"command":"ls"}' } } } });
+  ind.processEvent({ seq: 2, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls"}', callId: 'c1' } });
+  const text = ind.buildTraceText();
+  const count = text.split('🔧').length - 1;
+  assert.equal(count, 1, `expected one tool line, got ${count}: ${text}`);
+});
+await test('whole message tail-truncated to maxChars (newest survives)', () => {
+  const ind = new ProgressIndicator(makeOpts({ perBlockChars: 100, maxChars: 60 }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'AAAA'.repeat(50) } } });
+  ind.processEvent({ seq: 2, type: 'tool/call', data: { name: 'read', arguments: 'NEWEST', callId: 'c1' } });
+  const text = ind.buildTraceText();
+  assert.ok(text.length <= 60, `text too long: ${text.length}`);
+  assert.ok(text.includes('NEWEST'), 'newest item must survive tail truncation');
+  assert.ok(text.startsWith('…') || text.includes('…'), 'truncation marker present');
+});
+await test('text-delta / text block are NOT shown (reply is separate)', () => {
+  const ind = new ProgressIndicator(makeOpts());
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', index: 1, text: 'final reply body' } } });
+  const text = ind.buildTraceText();
+  assert.ok(!text.includes('final reply body'), 'reply text must not appear in the trajectory');
 });
 
 // ---- processEvents --------------------------------------------------------
 console.log('processEvents:');
-await test('parses reasoning + tool + text chronologically (last activity wins)', () => {
+await test('folds reasoning + tool chronologically', () => {
   const ind = new ProgressIndicator(makeOpts({ baseline: 0 }));
   const events = [
-    { seq: 1, type: 'reasoning-chunks', data: { texts: ['Let', ' me'] } },
-    { seq: 2, type: 'tool-call-chunks', data: { name: 'bash', args: ['{', '"command":"ls"}'] } },
-    { seq: 3, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la"}' } },
-    { seq: 4, type: 'text-chunks', data: { texts: ['Done.'] } },
+    { seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'Let ' } } },
+    { seq: 2, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'me' } } },
+    { seq: 3, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la"}', callId: 'c1' } },
   ];
   const done = ind.processEvents(events);
   assert.equal(done, false);
-  assert.equal(ind.reasoningBuf, 'Let me');
-  assert.equal(ind.replyBuf, 'Done.');
-  // text-chunks came after the tool/call, so the model has moved on to writing
-  // the reply — the indicator reflects the latest activity (not the tool).
-  assert.equal(ind.lastKind, 'text');
-  assert.ok(ind.buildStatusLine().includes('✍️ 正在写回复'));
+  assert.equal(ind.trace.length, 2, 'reasoning (merged) + tool');
+  assert.equal(ind.trace[0].kind, 'reasoning');
+  assert.equal(ind.trace[0].text, 'Let me');
+  assert.equal(ind.trace[1].kind, 'tool');
   // Re-processing the same log must not change state (idempotent watermark).
   ind.processEvents(events);
-  assert.equal(ind.reasoningBuf, 'Let me');
-  assert.equal(ind.replyBuf, 'Done.');
-});
-await test('tool/call as the last activity is the top-priority line', () => {
-  const ind = new ProgressIndicator(makeOpts());
-  ind.processEvents([
-    { seq: 1, type: 'reasoning-chunks', data: { texts: ['thinking'] } },
-    { seq: 2, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la"}' } },
-  ]);
-  assert.deepEqual(ind.currentTool, { name: 'bash', args: '{"command":"ls -la"}' });
-  assert.ok(ind.buildStatusLine().includes('🔧 正在调用工具 bash'));
-  assert.ok(ind.buildStatusLine().includes('ls -la'));
+  assert.equal(ind.trace.length, 2);
+  assert.equal(ind.trace[0].text, 'Let me');
 });
 await test('ignores events at/below baseline', () => {
   const ind = new ProgressIndicator(makeOpts({ baseline: 5 }));
   const done = ind.processEvents([
-    { seq: 5, type: 'reasoning-chunks', data: { texts: ['old'] } },
-    { seq: 6, type: 'reasoning-chunks', data: { texts: ['new'] } },
+    { seq: 5, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'old' } } },
+    { seq: 6, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'new' } } },
   ]);
   assert.equal(done, false);
-  assert.equal(ind.reasoningBuf, 'new');
+  assert.equal(ind.trace.length, 1);
+  assert.equal(ind.trace[0].text, 'new');
 });
 await test('turn/end returns true', () => {
   const ind = new ProgressIndicator(makeOpts());
   const done = ind.processEvents([{ seq: 1, type: 'turn/end', data: { kind: 'complete' } }]);
   assert.equal(done, true);
 });
-await test('a reply after a tool shows the reply, not the stale tool', () => {
+await test('packed reasoning-chunks / tool-call-chunks rows are understood', () => {
   const ind = new ProgressIndicator(makeOpts());
   ind.processEvents([
-    { seq: 1, type: 'tool/call', data: { name: 'bash', arguments: '{}' } },
-    { seq: 2, type: 'text-chunks', data: { texts: ['now writing'] } },
+    { seq: 1, type: 'reasoning-chunks', data: { texts: ['Let', ' me'] } },
+    { seq: 2, type: 'tool-call-chunks', data: { name: 'bash', args: ['{"command":"ls"}'] } },
   ]);
-  // lastKind now points at the reply; the stale tool is not shown.
-  assert.equal(ind.lastKind, 'text');
-  assert.ok(ind.buildStatusLine().includes('✍️ 正在写回复'));
-  assert.ok(!ind.buildStatusLine().includes('🔧 正在调用工具'));
-});
-await test('after tool/result the line is neutral until the next block', () => {
-  const ind = new ProgressIndicator(makeOpts());
-  ind.processEvents([
-    { seq: 1, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls"}' } },
-    { seq: 2, type: 'tool/result', data: {} },
-  ]);
-  assert.equal(ind.lastKind, null);
-  assert.equal(ind.buildStatusLine(), '⏳ 正在处理，请稍候…');
-  // The next block (thinking) replaces the neutral line.
-  ind.processEvents([{ seq: 3, type: 'reasoning-chunks', data: { texts: ['next'] } }]);
-  assert.equal(ind.lastKind, 'reasoning');
-  assert.ok(ind.buildStatusLine().includes('💭 思考中'));
+  assert.equal(ind.trace.length, 2);
+  assert.equal(ind.trace[0].text, 'Let me');
+  assert.equal(ind.trace[1].kind, 'tool');
 });
 
 // ---- full lifecycle with a mock client ------------------------------------
@@ -199,15 +188,16 @@ await test('posts message, edits on activity, deletes on turn/end', async () => 
   ind.start();
   await sleep(30);
   assert.ok(client.calls.send >= 1, 'indicator message was posted');
-  // Push some activity.
+  // Push some activity (the live `assistant/chunk` + `tool/call` shapes).
   events.push(
-    { seq: 1, type: 'reasoning-chunks', data: { texts: ['thinking...'] } },
-    { seq: 2, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la /home"}' } },
+    { seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'thinking...' } } },
+    { seq: 2, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la /home"}', callId: 'c1' } },
   );
   await sleep(60);
-  assert.ok(client.calls.edits.length >= 1, 'status was edited in place');
+  assert.ok(client.calls.edits.length >= 1, 'trajectory was edited in place');
   const lastEdit = client.calls.edits[client.calls.edits.length - 1].text;
-  assert.ok(lastEdit.includes('🔧 正在调用工具 bash'), `expected tool line, got: ${lastEdit}`);
+  assert.ok(lastEdit.includes('🔧 bash'), `expected tool line, got: ${lastEdit}`);
+  assert.ok(lastEdit.includes('ls -la /home'), `expected args, got: ${lastEdit}`);
   // Turn ends -> indicator stops and the message is deleted.
   events.push({ seq: 3, type: 'turn/end', data: { kind: 'complete' } });
   await sleep(60);
