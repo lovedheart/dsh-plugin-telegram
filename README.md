@@ -249,7 +249,8 @@ dsh-plugin-telegram/
 │   ├── poller.js       # Long-polling background service
 │   └── text.js         # Pure text helpers (Markdown→HTML, fence-aware chunking)
 ├── test/
-│   └── text.test.mjs   # Unit tests for the pure text helpers (npm test)
+│   ├── text.test.mjs   # Unit tests for the pure text helpers
+│   └── client.test.mjs # Unit tests for transient-error classification (npm test runs both)
 └── lib/                # Built output (copy of src/; `npm run prepare`)
     ├── index.js
     ├── client.js

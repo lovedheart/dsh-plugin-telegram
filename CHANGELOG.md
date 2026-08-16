@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.6] - 2026-08-16
+
+### Fixed
+- **Agent replies silently dropped to Telegram on transient network
+  failures** (user symptom: tool calls visible on the web UI but the
+  final reply never arrived on the phone): the direct-mode relay's final
+  `sendMessage` was a single attempt, and this host's link to
+  api.telegram.org times out ~45% of the time, so replies were lost
+  whenever that one send happened to fail. `sendText` now retries each
+  chunk on transient failures (undici transport errors / `fetch failed`
+  cause chains, 429 with `retry_after`, 409, 5xx) with exponential
+  backoff (1s→10s cap, max 5 attempts); permanent errors (400 bad
+  entities, 403) propagate immediately. Classification lives in
+  `client.js` as `isTransientTelegramError`, covered by 10 new unit
+  tests (`test/client.test.mjs`).
+
 ## [0.3.5] - 2026-08-16
 
 ### Fixed
