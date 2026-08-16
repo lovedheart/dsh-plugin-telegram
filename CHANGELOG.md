@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.4] - 2026-08-16
+
+### Fixed
+- **Sessions created via `/new` had no tools (Read/Write/Edit/Bash all
+  missing)**: an agent's tool catalog, prompt sections, and skill catalog
+  come from the agent preset it joins at setup time; dsh-agent-presets
+  warns that an agent published without a preset "resolves against the
+  empty global layer". `createTelegramAgent` now mirrors the DSH host's
+  `ensureSession()`/`composeAgent()` path: it reads the preset id from the
+  default agent's session header (`meta.agentPreset`, e.g. `standard` for
+  web) — falling back to `agentPresets.defaultId` — records it in the new
+  session's `meta` (so resume keeps it), and mounts it in `setup`:
+  `presets.mount(agentCtx, presetId)`. Existing tool-less sessions cannot
+  be fixed in place (presets bind at setup time); issue `/new` after the
+  restart to get a fully-featured session.
+
 ## [0.3.3] - 2026-08-16
 
 ### Fixed

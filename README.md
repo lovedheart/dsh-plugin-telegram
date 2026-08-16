@@ -47,9 +47,10 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `/start` 或 `/help` | 显示帮助 |
 
 普通消息路由到当前聊天的 active 会话；无显式路由时落到默认（第一个）会话。
-`/new` 创建的会话继承默认会话的工作目录（`cwd`）与模型（`provider`/`model`，
-来自 `agent.options`），避免 `deployment:persona` 段 `{{cwd}}`/`{{model}}`
-prompt 变量缺失，随插件卸载一起销毁。
+`/new` 创建的会话继承默认会话的工作目录（`cwd`）、模型（`provider`/`model`，
+来自 `agent.options`）和 agent preset（`meta.agentPreset`，setup 时
+`agentPresets.mount` 挂载）——preset 决定工具目录（Read/Write/Edit/Bash 等）、
+提示段和 skill 清单，随插件卸载一起销毁。
 
 命令菜单在 poller 启动时通过 Bot API `setMyCommands` 注册，Telegram 客户端
 输入 `/` 即可看到全部命令的自动补全。
