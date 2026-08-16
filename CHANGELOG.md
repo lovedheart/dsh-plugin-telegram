@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-08-16
+
+### Added
+- **Tool-guard approval over Telegram (parity with QwenPaw's `tool_guard` card)**
+  — previously, when the agent's permission policy is `ask` and a tool call needs
+  a decision (e.g. a sandbox escalation like writing outside the workspace), DSH
+  dispatches an `approval/request` to composed answerers. The Telegram plugin
+  registered **none**, so the ask was either claimed by the web host (the browser
+  UI, invisible on the phone) or failed closed — the user got no prompt at all.
+  This release adds an answerer that surfaces the ask to the phone:
+  - Registers an `approval/request` waterfall answerer with `prepend` so it runs
+    **before** the web answerer, then self-filters: it claims the agents it owns
+    (its `telegram-*` sessions, and — by default — the deployment's shared default
+    agent, which is where a plain message routes before `/new`) and delegates
+    everything else via `next()` so the web UI keeps working.
+  - Posts an inline-keyboard card to the owning chat:
+    `🛡️ 需要授权批准` + tool name + the reason DSH gave, with **✅ 批准 / ❌ 拒绝**
+    buttons (mirrors QwenPaw's tool_guard card).
+  - Resolves `allowed-once` (approve) / `rejected` (deny) when the user taps, and
+    `cancelled` on timeout, turn abort, or plugin unload. The card is edited in
+    place to show the outcome, and the button click is acked.
+  - Card delivery is retried like every other send; if it cannot be delivered the
+    ask is delegated (→ web UI or fail-closed), never silently swallowed.
+- **New config**: `approvalEnabled` (default `true`), `approvalTimeoutSec`
+  (default `1800`, `0` = no expiry), `approvalForDefaultAgent` (default `true`).
+
+### Tests
+- `test/approval.test.mjs` (21 cases): callback parse/keyboard/card/label,
+  delegation (disabled / non-owned agent / no chat), approve→`allowed-once` +
+  ack + resolved edit, deny→`rejected`, double-click no-op, unknown-key no-hang,
+  timeout→`cancelled`, abort→`cancelled`, pre-aborted→`cancelled` (no card),
+  send-failure→delegate, `cancelAll`, and default-agent ownership routing.
+
+## [0.4.0] - 2026-08-16
+
+### Added
+- **Live progress indicator (tool calls + thinking) on Telegram** — modelled on
+  QwenPaw's Telegram channel streaming/typing hooks. While the agent works on a
+  Telegram message (in BOTH `direct` and `tool` response modes), the plugin keeps
+  a single editable message alive that shows what it is doing right now, plus a
+  continuous "typing…" chat action (refreshed every ~4 s so it never expires):
+  - `🔧 正在调用工具 <name>：<args 预览>` while a tool call is in flight;
+  - `💭 思考中：<reasoning 末尾>` while the model is thinking;
+  - `✍️ 正在写回复：<文本末尾>` while the reply is being drafted;
+  - `⏳ 正在处理，请稍候…` as a neutral fallback (e.g. right after a `tool/result`,
+    before the next block starts).
+  The status reflects the **most recent** activity (recency, not fixed priority),
+  so once the model stops thinking and starts the reply the thinking line does
+  not linger. It is **deleted as soon as the turn ends** (`turn/end`), and it
+  self-cleans if a turn ever runs past `progressTimeoutSec`. Short turns that
+  finish before `progressDelaySec` never post the indicator at all. Purely
+  best-effort: a Telegram failure never affects the real reply path.
+
+  Implementation: a `ProgressIndicator` class (module-scope, unit-tested) polls
+  the agent's durable session log (`agent.session.events`) for this turn's events
+  (seq > the pre-injection baseline) using a `processedSeq` watermark so state is
+  never double-applied. New config options: `progressEnabled` (default true),
+  `progressDelaySec` (5), `progressIntervalMs` (1200), `progressTailChars` (240),
+  `progressTimeoutSec` (3600).
+
 ## [0.3.8] - 2026-08-16
 
 ### Changed

@@ -7,6 +7,8 @@
  * @module dsh-plugin-telegram/client
  */
 
+import { readFileSync } from 'node:fs';
+
 const DEFAULT_BASE_URL = 'https://api.telegram.org';
 const DEFAULT_LONG_POLL_TIMEOUT = 30;
 
@@ -144,6 +146,10 @@ export class TelegramClient {
     if (opts.messageThreadId) body.message_thread_id = opts.messageThreadId;
     if (opts.replyToMessageId) body.reply_to_message_id = opts.replyToMessageId;
     if (opts.disableNotification) body.disable_notification = opts.disableNotification;
+    // Inline keyboard (e.g. tool-guard approval buttons). The plugin passes a
+    // plain Telegram InlineKeyboardMarkup object ({inline_keyboard: [...]}) and
+    // we forward it verbatim.
+    if (opts.replyMarkup) body.reply_markup = opts.replyMarkup;
 
     const resp = await tgFetchOk(this.baseUrl, this.botToken, 'sendMessage', body);
     const msg = resp.result;
@@ -202,6 +208,58 @@ export class TelegramClient {
     const resp = await tgFetchOk(this.baseUrl, this.botToken, 'sendDocument', body);
     const msg = resp.result;
     if (!msg) throw new Error('sendDocument returned no result');
+    return {
+      messageId: Number(msg.message_id),
+      chatId: String(msg.chat?.id ?? opts.chatId),
+    };
+  }
+
+  /**
+   * Send a voice message (OGG Opus) by uploading a local file via multipart.
+   * @param {object} opts
+   * @param {string} opts.chatId
+   * @param {string} opts.filePath  Absolute path to an .ogg (Opus) file.
+   * @param {number} [opts.duration] Optional audio duration in seconds.
+   * @param {string} [opts.caption] Optional caption.
+   * @param {number} [opts.messageThreadId]
+   * @param {AbortSignal} [opts.signal]
+   */
+  async sendVoiceFile(opts) {
+    const data = readFileSync(opts.filePath);
+    const fileName = String(opts.filePath).split('/').pop() || 'voice.ogg';
+
+    const form = new FormData();
+    form.append('chat_id', String(opts.chatId));
+    if (opts.messageThreadId) form.append('message_thread_id', String(opts.messageThreadId));
+    if (opts.duration != null && Number.isFinite(Number(opts.duration))) {
+      form.append('duration', String(Math.round(Number(opts.duration))));
+    }
+    if (opts.caption) form.append('caption', opts.caption);
+    form.append('voice', new Blob([data], { type: 'audio/ogg' }), fileName);
+
+    const url = `${this.baseUrl}/bot${this.botToken}/sendVoice`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      body: form,
+      signal: opts.signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      let parsed;
+      try { parsed = JSON.parse(text); } catch { parsed = null; }
+      const errorCode = parsed && typeof parsed.error_code === 'number' ? parsed.error_code : undefined;
+      const description = parsed?.description || `${resp.status} ${resp.statusText}`;
+      if (errorCode === 429 || resp.status === 429) {
+        const retryAfter = parsed?.parameters?.retry_after;
+        throw new TelegramRateLimitError(Number(retryAfter) > 0 ? Number(retryAfter) : 5);
+      }
+      throw new TelegramApiError(`Telegram API sendVoice failed: ${description}`, text, resp.status, errorCode);
+    }
+
+    const data2 = await resp.json();
+    const msg = data2?.result;
+    if (!msg) throw new Error('sendVoice returned no result');
     return {
       messageId: Number(msg.message_id),
       chatId: String(msg.chat?.id ?? opts.chatId),

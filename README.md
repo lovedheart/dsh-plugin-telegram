@@ -126,7 +126,59 @@ dsh web --patch ./cordis.yml
 | `agentResponseMode` | string | `"tool"` | Response mode: `'tool'` or `'direct'` |
 | `replyPrefix` | string | `""` | Optional prefix for agent responses |
 | `directReplyTimeoutSec` | number | `3600` | (direct mode) Absolute safety cap (seconds) for the reply-forward watcher. The watcher is busy-aware — it follows the agent while it runs (long tool-call turns are fine) and forwards the reply the moment the agent goes idle with a fresh message; this cap only bounds pathological hangs. Short replies are still forwarded within seconds. |
+| `progressEnabled` | boolean | `true` | Show a live progress indicator (tool calls + thinking) on Telegram while the agent works. Works in both `direct` and `tool` response modes. |
+| `progressDelaySec` | number | `5` | Only post the indicator if the turn is still running after this many seconds (short turns show nothing). |
+| `progressIntervalMs` | number | `1200` | Minimum gap between in-place edits (Telegram rate-limits edits to ~1/s per message). |
+| `progressTailChars` | number | `240` | Max chars of the thinking/reply tail shown in the indicator. |
+| `progressTimeoutSec` | number | `3600` | Absolute cap before the indicator self-cleans (pathological hangs only). |
+| `approvalEnabled` | boolean | `true` | When the agent's permission policy is `ask` and a tool call needs a decision (e.g. a sandbox escalation), post an inline-keyboard approval card (✅ 批准 / ❌ 拒绝) to the owning chat instead of failing closed. See "Tool-guard approval" below. |
+| `approvalTimeoutSec` | number | `1800` | How long an approval card waits for a tap before expiring (`cancelled`). `0` = no expiry. |
+| `approvalForDefaultAgent` | boolean | `true` | Also surface asks from the deployment's **shared default agent** to the phone. Before `/new`, a plain Telegram message routes to that agent, so this is what makes the card appear in the state you usually test in. Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
+
+### Progress indicator (tool calls + thinking)
+
+While the agent works on a Telegram message, a single editable message shows what it
+is doing right now (in both `direct` and `tool` modes), plus a continuous "typing…"
+chat action. It reflects the **most recent** activity:
+
+- `🔧 正在调用工具 <name>：<args 预览>` — a tool call is in flight;
+- `💭 思考中：<reasoning 末尾>` — the model is thinking;
+- `✍️ 正在写回复：<文本末尾>` — the reply is being drafted;
+- `⏳ 正在处理，请稍候…` — neutral fallback (e.g. right after a `tool/result`).
+
+It is deleted the moment the turn ends (`turn/end`), self-cleans after
+`progressTimeoutSec`, and never shows for turns that finish before `progressDelaySec`.
+Set `progressEnabled: false` to turn it off. It is purely best-effort — a Telegram
+failure never affects the real reply.
+
+### Tool-guard approval (permission prompts on the phone)
+
+When the agent's permission policy is `ask` (the default) and a tool call needs a
+decision — for example a **sandbox escalation** like writing a file outside the
+workspace, or a guarded `pre-execute` check — DSH resolves it through an
+`approval/request` waterfall of *answerers*. If no answerer claims the request it
+**fails closed**: the user sees nothing and the action is denied.
+
+Before this feature, the Telegram plugin registered no answerer, so a Telegram
+agent's ask was claimed by the web host (the browser UI, invisible on the phone)
+or failed closed — the reported "no permission prompt on the phone" bug. This
+release adds one, modelled on QwenPaw's `tool_guard` card:
+
+- The plugin registers an `approval/request` answerer (run **before** the web
+  answerer) that claims the requests it owns — its own `telegram-*` agents and, by
+  default, the shared default agent — and delegates the rest so the web UI keeps
+  working.
+- It posts an inline-keyboard card to the owning chat: `🛡️ 需要授权批准` + the tool
+  name + the reason DSH supplied, with **✅ 批准 / ❌ 拒绝** buttons.
+- Tapping resolves the request: approve → `allowed-once`, deny → `rejected`.
+  A timeout (`approvalTimeoutSec`), a turn abort, or an unload resolves it as
+  `cancelled`. The card is edited in place to show the outcome and the button
+  click is acked.
+
+Set `approvalEnabled: false` to turn it off entirely. If the card cannot be
+delivered the request is delegated (to the web UI, or it fails closed) — it is
+never silently dropped.
 
 ## Creating a Telegram Bot
 
