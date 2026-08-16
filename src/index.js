@@ -22,6 +22,12 @@ import {
   describeRuleKey,
   TELEGRAM_SESSION_PREFIX,
 } from './approval.js';
+import {
+  createQuestionModule,
+  createMuxSubscriber,
+  parseSseFrames,
+  parseQuestionCallback,
+} from './questions.js';
 import { chunkText, markdownToTelegramHtml, guardConvertedLength } from './text.js';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -114,6 +120,21 @@ const defaults = {
   // (atomic write, survives reload); manage them via /approval. '' = default
   // location under $DSH_HOME; set an absolute path to relocate.
   approvalAlwaysPath: '',
+  // ask_user_question answerer (v0.4.4). When the agent calls ask_user_question
+  // (pick an option / type your own), the web host owns the single UI provider
+  // and only the BROWSER sees the prompt — a phone-only user waits forever. This
+  // plugin subscribes to the web host's /api/events.mux over loopback and posts
+  // an inline-keyboard card for questions belonging to our Telegram agents (or,
+  // when questionsForDefaultAgent is true, the default shared agent); answers go
+  // back via /api/respond. A plain-text reply to a single-question card is
+  // consumed as a custom answer. questionsForDefaultAgent mirrors
+  // approvalForDefaultAgent (default true, only when defaultChatId is set).
+  questionsEnabled: true,
+  questionsForDefaultAgent: true,
+  // Web host base URL the plugin reaches over loopback. Normally derived from
+  // DSH_WEB_URL (the plugin runs inside the `dsh web` process); set to
+  // override (e.g. a non-default port) or empty to force the 3080 default.
+  webUrl: '',
   // Voice (TTS) — used by telegram_send_voice.
   ttsEndpoint: 'http://127.0.0.1:8890', // local Qwen3-TTS service
   ttsLang: 'Chinese',                   // default language label for synthesis
@@ -151,6 +172,9 @@ const schema = {
   approvalTimeoutSec: ['number'],
   approvalForDefaultAgent: ['boolean'],
   approvalAlwaysPath: ['string'],
+  questionsEnabled: ['boolean'],
+  questionsForDefaultAgent: ['boolean'],
+  webUrl: ['string'],
   ttsEndpoint: ['string'],
   ttsLang: ['string'],
   verbose: ['boolean'],
@@ -540,6 +564,21 @@ export async function apply(ctx, config) {
   const approvalTimeoutMs = Math.max(0, Number(c.approvalTimeoutSec) || 0) * 1000;
   const approvalForDefaultAgent = c.approvalForDefaultAgent !== false;
 
+  // ask_user_question answerer (v0.4.4): surfaces the agent's "pick an option
+  // / type your own" prompts on Telegram. We subscribe to the web host's
+  // /api/events.mux over loopback and answer via /api/respond. `webUrl` is the
+  // dsh web base URL — the plugin runs inside the SAME process, so
+  // process.env.DSH_WEB_URL (set by `dsh web`) is authoritative; the config
+  // key only exists as an override for unusual deployments.
+  // `questionsForDefaultAgent` mirrors `approvalForDefaultAgent`: before /new a
+  // plain Telegram message routes to the deployment's DEFAULT (shared) agent,
+  // so its questions must also reach the phone by default.
+  const questionsEnabled = c.questionsEnabled !== false;
+  const questionsForDefaultAgent = c.questionsForDefaultAgent !== false;
+  const webUrl =
+    (typeof c.webUrl === 'string' && c.webUrl.trim() ? c.webUrl.trim()
+      : process.env.DSH_WEB_URL || '') || 'http://127.0.0.1:3080';
+
   // Allow-always store: remembers rule keys the user has approved-with-remember
   // so matching future asks auto-approve. The file path is resolved lazily
   // (DSH_HOME may be known only at store-creation time). Empty path = disabled
@@ -584,6 +623,12 @@ export async function apply(ctx, config) {
   // callback handler can route button taps. Null when approval is disabled.
   let approvalCancel = null;
   let approvalHandleQuery = null;
+  // ask_user_question answerer handles (v0.4.4) — same pattern: set inside the
+  // polling block so the callback + message handlers and cleanup can reach them.
+  let questionCancel = null;
+  let questionHandleQuery = null;
+  let questionConsumeText = null;
+  let muxStop = null;
 
   // Dedup set of injected Telegram message ids (in-memory; bounded by a cap
   // below so a long-running plugin can't leak memory).
@@ -1751,6 +1796,16 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       // Plan A commands: /new, /sessions, /use <id>, /help
       if (message.text && await handleCommands(message)) return;
 
+      // ask_user_question custom answer (v0.4.4): if the agent is waiting on a
+      // single-question card for this chat and the user replies with plain text
+      // (ideally replying to the card), consume it as that question's custom
+      // answer instead of injecting it as a new agent message. Multi-question
+      // cards answer via buttons only (consumeTextReply returns false).
+      if (message.text && questionConsumeText && questionConsumeText(message.chatId, message.text)) {
+        log('info', `Chat ${message.chatId}: plain-text reply consumed as ask_user_question answer`);
+        return;
+      }
+
       // Dedup: skip if we already injected this message id (poller-level
       // dedup is the primary gate; this is a second line of defence for
       // handler-level retries).
@@ -1874,12 +1929,21 @@ ${replyInstruction}`,
     // working for web-originated agents. The card is an inline keyboard; the
     // poller's callback handler below resolves the promise when the user taps.
     // ---------------------------------------------------------------------
-    if (approvalEnabled && typeof ctx.on === 'function') {
-      const approvalOwnership = (agent) => {
-        const all = ctx.get?.('agents')?.list?.() ?? [];
-        const askId = agent?.id ?? agent?.session?.id;
-        const hit = all.find((a) => String(a?.id) === String(askId) || String(a?.session?.id) === String(askId));
-        const sidStr = String(hit?.session?.id ?? askId ?? '');
+    // Shared ownership policy: does this agent's session belong to us, and to
+    // which Telegram chat does it route? Used by BOTH the approval answerer
+    // (v0.4.1) and the ask_user_question answerer (v0.4.4).
+    //   `allowDefault` gates case 2 (the deployment's DEFAULT/shared agent):
+    //   approval passes `approvalForDefaultAgent`, questions passes
+    //   `questionsForDefaultAgent`.
+    // Returns {chatId, threadId} or null (null → the web UI keeps it).
+    const telegramAgentOwnership = (sessionIdLike, { allowDefault = true } = {}) => {
+      const all = ctx.get?.('agents')?.list?.() ?? [];
+      const askId =
+        typeof sessionIdLike === 'string'
+          ? sessionIdLike
+          : (sessionIdLike?.id ?? sessionIdLike?.session?.id);
+      const hit = all.find((a) => String(a?.id) === String(askId) || String(a?.session?.id) === String(askId));
+      const sidStr = String(hit?.session?.id ?? askId ?? '');
 
         // Case 1 — this plugin's own agents (session id `telegram-*`, created
         // by /new or a fresh chat). Route to the owning chat, else default.
@@ -1896,8 +1960,9 @@ ${replyInstruction}`,
         // Case 2 — the deployment's DEFAULT (shared web) agent. Before /new a
         // plain Telegram message routes here (resolveChatAgent falls back to
         // all[0]), so its asks must also reach the phone or the user gets no
-        // card. Only when a default chat is configured and the user opted in.
-        if (approvalForDefaultAgent && defaultChatId && hit === all[0]) {
+        // card. Only when a default chat is configured and the user opted in
+        // (per-caller: approvalForDefaultAgent / questionsForDefaultAgent).
+        if (allowDefault && defaultChatId && hit === all[0]) {
           return { chatId: String(defaultChatId), threadId: null };
         }
 
@@ -1905,13 +1970,14 @@ ${replyInstruction}`,
         return null;
       };
 
+    if (approvalEnabled && typeof ctx.on === 'function') {
       const approvalModule = createApprovalModule({
         client,
         enabled: () => approvalEnabled,
         timeoutMs: approvalTimeoutMs,
         log,
         escape: (s) => escapeHtml(s),
-        ownership: approvalOwnership,
+        ownership: (agent) => telegramAgentOwnership(agent?.id ?? agent?.session?.id, { allowDefault: approvalForDefaultAgent }),
         ackCallback: (qid, toast) => {
           if (qid) return client.answerCallbackQuery(qid, toast);
           return Promise.resolve();
@@ -1944,11 +2010,54 @@ ${replyInstruction}`,
       log('info', 'Approval (tool-guard) answerer registered for Telegram agents.');
     }
 
+    // ---------------------------------------------------------------------
+    // ask_user_question answerer (v0.4.4).
+    //
+    // The agent can pause to ask the user to pick an option (or type their own
+    // prompt) via the `ask_user_question` tool. DSH's web host owns the single
+    // UI provider and only the BROWSER sees the prompt — a phone-only user waits
+    // forever. We subscribe to the web host's /api/events.mux over loopback
+    // (same process), claim the questions that belong to our Telegram agents
+    // (same ownership policy as approval), post an inline-keyboard card, and
+    // answer via /api/respond. A plain-text reply to a single-question card is
+    // consumed as a custom answer. Best-effort: a loopback failure never
+    // affects the real reply — the web UI keeps working.
+    // ---------------------------------------------------------------------
+    if (questionsEnabled && client) {
+      const respondQuestion = async (body) => {
+        const res = await fetch(`${webUrl.replace(/\/$/, '')}/api/respond`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const json = await res.json().catch(() => ({}));
+        return json; // { accepted: true } | { accepted: false, reason }
+      };
+      const questionModule = createQuestionModule({
+        log,
+        escape: (s) => escapeHtml(s),
+        client,
+        ownership: (sessionId) => telegramAgentOwnership(sessionId, { allowDefault: questionsForDefaultAgent }),
+        respond: respondQuestion,
+      });
+      questionHandleQuery = questionModule.handleCallbackQuery;
+      questionConsumeText = (chatId, text) => questionModule.consumeTextReply(chatId, text);
+      questionCancel = () => { try { questionModule.cancelAll(); } catch { /* ignore */ } };
+      muxStop = createMuxSubscriber({
+        url: webUrl,
+        log,
+        onFrame: (frame) => questionModule.handleFrame(frame),
+      });
+      log('info', `ask_user_question answerer registered (subscribed to ${webUrl}/api/events.mux).`);
+    }
+
     poller.onCallbackQuery(async (query) => {
       log('info', `Callback query from ${query.from.username || query.from.id}: data="${query.data}"`);
-      // Route tool-guard approval button taps to the approval module (it acks
-      // the callback itself). Any other callback falls through to a plain ack.
+      // Route button taps to the owning module (each acks its own callback).
+      // Tool-guard approval first, then ask_user_question. Anything else falls
+      // through to a plain ack.
       if (approvalHandleQuery && approvalHandleQuery(query)) return;
+      if (questionHandleQuery && (await questionHandleQuery(query))) return;
       await client.answerCallbackQuery(query.id, 'Acknowledged');
     });
 
@@ -1989,6 +2098,14 @@ ${replyInstruction}`,
       try { approvalCancel?.(); } catch { /* ignore */ }
       approvalCancel = null;
       approvalHandleQuery = null;
+      // Stop the ask_user_question answerer: drop the mux subscription and
+      // forget pending cards (no network — the web host keeps working).
+      try { muxStop?.(); } catch { /* ignore */ }
+      muxStop = null;
+      try { questionCancel?.(); } catch { /* ignore */ }
+      questionCancel = null;
+      questionHandleQuery = null;
+      questionConsumeText = null;
       // Stop any in-flight progress indicators so no stray "working…" message
       // is left behind on unload.
       for (const ind of activeIndicators.values()) {

@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.4] - 2026-08-16
+
+### Added
+- **`ask_user_question` on Telegram — pick an option OR type your own answer**
+  — when the agent pauses to ask the user a question (the `ask_user_question`
+  tool), DSH's web host owns the single UI provider and **only the browser**
+  sees the prompt, so a phone-only user waits forever. A new `questions.js`
+  answerer subscribes to the web host's `/api/events.mux` over loopback (same
+  process, `DSH_WEB_URL` / 127.0.0.1:3080), claims the questions that belong to
+  our Telegram agents (same ownership policy as approval, incl. the default
+  shared agent), and posts an **inline-keyboard card** to the owning chat:
+  - **Single-select**: tap an option to answer instantly, **or just reply the
+    card with plain text** — the text becomes the question's custom answer
+    (this is the "type my own prompt" path the user asked for).
+  - **Multi-select**: toggle options, then tap **✅ 提交** to submit the chosen
+    labels (multi-question cards are button-only; unanswered questions are
+    skipped).
+  - **❌ 取消** cancels the ask. If the web UI answers first, the card flips to
+    "已在网页端回答" (first answer wins — a late phone answer is dropped, not
+    double-submitted). Reconnects are safe: the mux replays pending questions.
+  - Web-originated agents (not ours) are left to the browser — no double cards.
+- New module `src/questions.js`: `parseQuestionCallback`, `buildQuestionCard`,
+  `createQuestionModule`, `parseSseFrames`, `createMuxSubscriber`. All side
+  effects (client, respond, ownership, log) are dependency-injected.
+- Config keys: **`questionsEnabled`** (default `true`),
+  **`questionsForDefaultAgent`** (default `true`, mirrors
+  `approvalForDefaultAgent`), **`webUrl`** (loopback base URL override;
+  defaults to `DSH_WEB_URL` then `http://127.0.0.1:3080`).
+- `telegramAgentOwnership` was extracted from the approval block and is now
+  shared by both the approval and question answerers (each passes its own
+  `allowDefault` flag).
+
+### Tests
+- `npm test` now **110 items** (questions 33): callback parsing, card layout
+  (single/multi/multiSelect, escaping, truncation), single-select / multiSelect
+  / custom-text / cancel answer flows, ownership gating, replay dedup,
+  web-first settlement, `not-pending` handling, SSE frame parsing, and the
+  mux subscriber against a fake `fetch` SSE stream.
+
 ## [0.4.3] - 2026-08-16
 
 ### Changed

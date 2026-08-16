@@ -137,6 +137,9 @@ dsh web --patch ./cordis.yml
 | `approvalTimeoutSec` | number | `1800` | How long an approval card waits for a tap before expiring (`cancelled`). `0` = no expiry. |
 | `approvalForDefaultAgent` | boolean | `true` | Also surface asks from the deployment's **shared default agent** to the phone. Before `/new`, a plain Telegram message routes to that agent, so this is what makes the card appear in the state you usually test in. Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
 | `approvalAlwaysPath` | string | `''` | File where "🔁 一直允许" remembers are persisted (defaults to `$DSH_HOME/telegram-approval-always.json`). Set an absolute path to relocate. |
+| `questionsEnabled` | boolean | `true` | When the agent calls `ask_user_question` (pick an option / type your own), post an inline-keyboard question card to the owning chat and answer via the web host, so a phone-only user isn't left waiting on the browser. See "Question cards" below. |
+| `questionsForDefaultAgent` | boolean | `true` | Also surface questions from the deployment's **shared default agent** to the phone (mirrors `approvalForDefaultAgent`). Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
+| `webUrl` | string | `''` | Loopback base URL of the `dsh web` host the plugin reaches for question events/responses. Defaults to `DSH_WEB_URL` (set by `dsh web`), then `http://127.0.0.1:3080`. Override only for non-default ports. |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
 
 ### Live trajectory (tool calls + thinking)
@@ -207,6 +210,38 @@ a one-shot `allowed-once`. This plugin adds it on top:
 Set `approvalEnabled: false` to turn it off entirely. If the card cannot be
 delivered the request is delegated (to the web UI, or it fails closed) — it is
 never silently dropped.
+
+### Question cards (`ask_user_question` on the phone)
+
+Sometimes the agent stops to **ask the user a question** — pick one of several
+options, or type your own answer (the `ask_user_question` tool). In DSH the web
+host owns the single UI provider for these asks, so **only the browser** sees
+the prompt; a phone-only user would wait forever with nothing on screen. This
+plugin adds a Telegram answerer:
+
+1. It subscribes to the web host's `/api/events.mux` over loopback (the plugin
+   runs inside the same `dsh web` process, reached via `DSH_WEB_URL` /
+   `http://127.0.0.1:3080`).
+2. When a `question/requested` frame arrives for **an agent this plugin owns**
+   (or, with `questionsForDefaultAgent`, the shared default agent), it posts an
+   **inline-keyboard card** to the owning chat.
+3. Your answer goes back to the web host via `/api/respond`.
+
+**How you answer:**
+- **Single-choice question** — tap the option to answer instantly, **or just
+  reply the card with plain text**: your text becomes the question's custom
+  answer (this is the "type my own prompt" path).
+- **Multi-choice question** — tap options to toggle them, then tap **✅ 提交**
+  to submit. A question with several sub-questions is button-only; any
+  sub-question you leave unanswered is skipped.
+- **❌ 取消** cancels the ask.
+- If the **web UI answers first**, the card flips to "已在网页端回答" — the first
+  answer wins, so a late phone tap is dropped rather than double-submitted.
+- Reconnecting the bot is safe: the mux replays still-pending questions, so a
+  card is never lost on a drop.
+
+Questions from **other (web-only) agents** are left to the browser — you won't
+see duplicate cards. Set `questionsEnabled: false` to turn this off.
 
 ## Creating a Telegram Bot
 
