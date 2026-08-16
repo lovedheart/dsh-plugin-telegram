@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.5] - 2026-08-16
+
+### Fixed
+- **`/new` / `/clear` failed with
+  `(intermediate value)?.commit is not a function`**: the agent factory
+  treats a non-`void` return from `CreateAgentOptions.setup` as an
+  `AgentSetupCommit` handle it invokes
+  (`await raceAbort(setup?.(agent.ctx))?.commit()` in dsh-agent-loop
+  `createAgent`; type contract:
+  `AgentSetup = (ctx) => AgentSetupCommit | Promise<AgentSetupCommit | void> | void`).
+  The v0.3.4 setup callback returned `presets.mount(...)`'s Promise, so the
+  factory called `.commit()` on the resolved preset object. The setup is now
+  side-effect-only (`await` the mount, return `void`) — matching the host's
+  `composeAgent()` contract.
+
 ## [0.3.4] - 2026-08-16
 
 ### Fixed
