@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-telegram",
   "description": "DSH plugin for Telegram bot integration - send/receive messages via Telegram Bot API",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

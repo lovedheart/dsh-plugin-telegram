@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.7] - 2026-08-16
+
+### Fixed
+- **Second (long-running) message's reply never reached Telegram — "I can only
+  receive 1 message"**: in `direct` mode, after injecting a Telegram message
+  the plugin runs `watchDirectReply`, which polls until the agent is idle AND
+  a new assistant message appears after the injection baseline, then forwards
+  it. That loop had a **hard-coded 5-minute deadline**. A short reply (e.g. a
+  25-second turn) made it in time; a long multi-tool-call turn (measured: an
+  819 s / 13 m 39 s session that built a whole plugin across 62 tool calls)
+  outlived the deadline, so the watcher gave up and the final reply was
+  orphaned — visible on the web UI (mux event stream) but never sent to
+  Telegram. The cap is now configurable as `directReplyTimeoutSec` (default
+  `3600` = 1 h); it is only a ceiling, short replies are still forwarded
+  within seconds.
+
+### Added
+- `directReplyTimeoutSec` config (schema + defaults + apply) for the direct-mode
+  reply-forward deadline.
+
 ## [0.3.6] - 2026-08-16
 
 ### Fixed

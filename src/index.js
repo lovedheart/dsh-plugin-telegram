@@ -41,6 +41,11 @@ const defaults = {
   injectToAgent: true,        // Whether to inject messages to agent loop
   agentResponseMode: 'tool',  // 'tool' = agent uses telegram_send_message, 'direct' = auto-capture & send
   replyPrefix: '',            // Prefix added to agent's direct reply
+  // direct mode: max seconds to wait for a turn's final assistant message
+  // before giving up on auto-forwarding. Long agent work (tool-call chains)
+  // can easily exceed a few minutes, so the default is generous: 1 hour.
+  // Short replies are still forwarded within seconds — this is only the cap.
+  directReplyTimeoutSec: 3600,
   // Logging
   verbose: false,             // Enable debug and info logs (default: errors only)
 };
@@ -62,6 +67,7 @@ const schema = {
   injectToAgent: ['boolean'],
   agentResponseMode: ['string'],
   replyPrefix: ['string'],
+  directReplyTimeoutSec: ['number'],
   verbose: ['boolean'],
 };
 export const Config = {
@@ -155,6 +161,7 @@ export async function apply(ctx, config) {
   const injectToAgent = c.injectToAgent !== false;
   const agentResponseMode = c.agentResponseMode || 'tool';
   const replyPrefix = c.replyPrefix || '';
+  const directReplyTimeoutMs = Math.max(10, Number(c.directReplyTimeoutSec) || 3600) * 1000;
 
   // Logging — prefer ctx.logger when the plugin is loaded inside a full DSH
   // host; fall back to console for unit tests or standalone loads.
@@ -300,7 +307,10 @@ export async function apply(ctx, config) {
       const baseline = session && Array.isArray(session.events) ? session.events.length : 0;
 
       // 1) Let the turn finish: idle + an assistant message exists after baseline.
-      const deadline = Date.now() + 5 * 60 * 1000;
+      // Long agent work (multi-tool-call turns) can run many minutes; the
+      // timeout is configurable (directReplyTimeoutSec, default 1h) and is
+      // only a cap — short replies are forwarded within seconds.
+      const deadline = Date.now() + directReplyTimeoutMs;
       let ready = false;
       while (Date.now() < deadline) {
         const evts = session?.events;
