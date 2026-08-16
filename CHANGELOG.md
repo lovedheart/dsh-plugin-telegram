@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.3] - 2026-08-16
+
+### Fixed
+- **Misclassified network errors as "Unexpected error"**: Node's global
+  `fetch` (undici) reports transport failures as `TypeError: fetch failed`
+  with the real cause (`ETIMEDOUT`, `ECONNRESET`, ...) nested in
+  `err.cause`. `_isNetworkError` only inspected the top-level error, so a
+  plain network hiccup during `getUpdates` fell into the generic error
+  branch (loud `error` log, flat 10 s retry) instead of the network-error
+  branch (warn + exponential backoff, silent with `verbose: false`). The
+  check now walks `err` → `err.cause` → `err.cause.cause` and matches
+  undici error names/codes (`UND_ERR_*`, `UndiciError`, `TimeoutError`,
+  `EAI_AGAIN`, ...). The poll loop itself was always resilient (catch +
+  retry); this only fixes classification and log noise.
+
 ## [0.3.0] - 2026-08-16
 
 ### Added
