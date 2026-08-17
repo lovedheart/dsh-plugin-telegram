@@ -31,7 +31,7 @@ import {
 import { chunkText, markdownToTelegramHtml, guardConvertedLength } from './text.js';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -95,6 +95,28 @@ const defaults = {
   progressPerBlockChars: 240,   // max chars per trajectory line (reasoning/tool)
   progressMaxChars: 1500,       // max chars of the whole trajectory message
   progressTimeoutSec: 3600,  // absolute cap before the indicator self-cleans
+  // Streaming reply (方案B, direct mode only). Instead of "wait for the turn to
+  // end, then send the full reply", show the reply BUILDING in place: a
+  // placeholder message is edited incrementally as `text-delta` events arrive
+  // (live text is plain so partial markdown never breaks parsing), and at
+  // turn/end the placeholder is edited in place to the final HTML render (or,
+  // when it exceeds the 4096 hard limit, deleted and chunk-sent instead).
+  // Only active when agentResponseMode is 'direct' — in 'tool' mode the agent
+  // sends via telegram_send_message itself, so the plugin must not also send.
+  // The activity-trail ProgressIndicator still runs alongside it.
+  streamingReply: true,
+  // Inbound media download + forward (parity with QwenPaw). When the user sends
+  // a photo/document/video/audio/voice, download it to a local dir and tell the
+  // agent where it is (and, for photos, optionally attach a vision block).
+  forwardInboundMedia: true,
+  // Attach an inbound photo as a VISION content block so a multimodal model can
+  // "see" it. Default false: the current deployment model (Qwen text-only)
+  // would throw UNSUPPORTED_CONTENT on an image block and break the turn. The
+  // photo is still downloaded + its path told to the agent either way; flip
+  // this on only when using a vision-capable model.
+  inboundImageToModel: false,
+  // Directory for downloaded inbound media. '' = $DSH_HOME/telegram-inbound.
+  inboundMediaDir: '',
   // Tool-guard approval (parity with QwenPaw's Telegram tool_guard card). When
   // the agent's permission policy is 'ask' and a tool call needs an approval
   // decision (sandbox escalation, guarded pre-execute), DSH dispatches an
@@ -168,6 +190,10 @@ const schema = {
   progressPerBlockChars: ['number'],
   progressMaxChars: ['number'],
   progressTimeoutSec: ['number'],
+  streamingReply: ['boolean'],
+  forwardInboundMedia: ['boolean'],
+  inboundImageToModel: ['boolean'],
+  inboundMediaDir: ['string'],
   approvalEnabled: ['boolean'],
   approvalTimeoutSec: ['number'],
   approvalForDefaultAgent: ['boolean'],
@@ -291,6 +317,57 @@ export function compactText(str) {
 }
 
 /**
+ * Extract the command (slash + name + args) from a message, preferring the
+ * `bot_command` entity — the only signal that is guaranteed to be addressed
+ * to THIS bot (and to handle the `@botusername` suffix in groups, e.g.
+ * `/new@MyBot` — which a naive `text.startsWith('/')` split would reject
+ * because the command switch matches `/new` exactly). Falls back to the
+ * leading `/word` token when the entity is absent.
+ *
+ * Returns { cmd, args } (cmd includes the leading slash, no `@suffix`) or null
+ * when the message is not a command.
+ */
+export function extractCommand(message) {
+  const text = message.text ?? '';
+  const entities = Array.isArray(message.entities) ? message.entities : [];
+  const cmdEnt = entities.find((e) => e.type === 'bot_command');
+  if (cmdEnt && cmdEnt.offset === 0) {
+    const token = text.slice(cmdEnt.offset, cmdEnt.offset + cmdEnt.length) || '/';
+    const name = token.replace(/@.*/, ''); // strip @botusername suffix
+    if (name && name[0] === '/') {
+      const after = text.slice(cmdEnt.offset + cmdEnt.length).replace(/^\s+/, '');
+      return { cmd: name, args: after.trim() };
+    }
+  }
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return null;
+  const [first, ...rest] = trimmed.split(/\s+/);
+  return { cmd: first, args: rest.join(' ').trim() };
+}
+
+/**
+ * Sniff a raster image's media type from its leading bytes (magic-number
+ * detection). Returns one of 'image/jpeg' | 'image/png' | 'image/webp' |
+ * 'image/gif', or null when the bytes are not a supported raster. Used to give
+ * the attachments service a media type that matches the ACTUAL bytes — saveImage
+ * decodes the image and rejects a mismatching declared type.
+ */
+export function sniffImageMediaType(bytes) {
+  if (!bytes || bytes.length < 4) return null;
+  const b0 = bytes[0], b1 = bytes[1], b2 = bytes[2], b3 = bytes[3];
+  if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) return 'image/jpeg'; // JFIF / Exif
+  if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47) return 'image/png';
+  if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) return 'image/gif';
+  // WEBP: "RIFF"...."WEBP"
+  if (b0 === 0x52 && b1 === 0x49 && b2 === 0x46 && b3 === 0x46
+      && bytes.length >= 12
+      && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+    return 'image/webp';
+  }
+  return null;
+}
+
+/**
  * Live Telegram trajectory indicator for one agent turn. Modelled on QwenPaw's
  * Telegram channel: ONE message that is edited in place (throttled) to show a
  * rolling trail of the agent's recent activity — the streaming reasoning (💭)
@@ -336,6 +413,19 @@ export class ProgressIndicator {
     // fold the whole log on every tick but skip already-seen events, so state
     // is never double-applied.
     this.processedSeq = this.o.baseline ?? 0;
+    // Streaming reply (方案B, direct mode only): the SAME in-place message that
+    // shows the activity trail also shows the final reply as it builds —
+    // once `text-delta` events arrive, buildTraceText switches to the reply
+    // (so the user watches the answer appear), and stop() finalizes it with an
+    // HTML render (or a chunked send when it exceeds the 4096 hard limit).
+    this.streaming = o.streaming === true;
+    this.replyText = '';       // accumulated from text-delta (live preview)
+    this.finalReplyText = '';  // authoritative full text from assistant/message
+    this.finalized = false;
+    // Set true right before stop() when the stop was triggered by a turn/end
+    // event (vs. preemption by a newer turn or the timeout cap). Decides whether
+    // a failed turn should surface a notice to the phone.
+    this.endedByTurnEnd = false;
   }
 
   /** Record a completed tool call, deduped by id. */
@@ -373,6 +463,18 @@ export class ProgressIndicator {
    */
   buildTraceText() {
     const per = this.o.perBlockChars ?? 240;
+    const max = this.o.maxChars ?? 1500;
+    // Streaming reply (方案B): once the final reply starts streaming, it
+    // dominates the message — show its TAIL (newest text, like live typing),
+    // tail-truncated to `maxChars`. Plain text so partial markdown never
+    // breaks parsing; the final HTML render happens at stop().
+    if (this.streaming && this.replyText) {
+      const reply = compactText(this.replyText);
+      const header = '💬 回复（生成中）\n';
+      return reply.length > max
+        ? header + '…' + reply.slice(-(max))
+        : header + reply;
+    }
     const parts = [];
     for (const b of this.trace) {
       if (b.kind === 'reasoning') {
@@ -385,7 +487,6 @@ export class ProgressIndicator {
     }
     const header = '📜 运行轨迹（最新）\n';
     if (!parts.length) return header + '⏳ 正在处理，请稍候…';
-    const max = this.o.maxChars ?? 1500;
     let body = parts.join('\n');
     if ((header + body).length > max) {
       const budget = max - header.length;
@@ -447,17 +548,35 @@ export class ProgressIndicator {
   processEvent(evt) {
     const type = evt?.type;
     const d = evt?.data || {};
+    if (type === 'assistant/message' && this.streaming) {
+      // Authoritative final reply (full message). Replaces any accumulated
+      // text-delta so the finalized message is never truncated/lossy.
+      const msg = d.message;
+      if (msg && Array.isArray(msg.content)) {
+        const t = msg.content
+          .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text).join('\n').trim();
+        if (t) this.finalReplyText = t;
+      }
+      return;
+    }
     if (type === 'assistant/chunk') {
       const chunk = d.chunk || {};
       if (chunk.type === 'reasoning-delta') {
         this._addReasoning(chunk.text);
+      } else if (chunk.type === 'text-delta' && this.streaming) {
+        // Final-reply text increment (方案B). Accumulated so the in-place
+        // message can show the reply building. (The authoritative full text is
+        // re-read from the final assistant/message event at finalize time, so
+        // a missed delta is harmless.)
+        this.replyText += String(chunk.text ?? '');
       } else if (chunk.type === 'block-end' && chunk.block) {
         const blk = chunk.block;
         if (blk.type === 'reasoning') this._addReasoning(blk.text);
         else if (blk.type === 'tool-call') this._addTool(blk.name, blk.arguments, blk.id);
-        // text blocks are the final reply — handled by the reply path, not here.
+        // text blocks are the final reply — handled by the streaming path.
       }
-      // text-delta / tool-call-delta / block-start / usage / finish: ignored.
+      // tool-call-delta / block-start / usage / finish: ignored.
     } else if (type === 'tool/call') {
       this._addTool(d.name, d.arguments, d.callId);
     } else if (type === 'reasoning-chunks') {
@@ -483,12 +602,53 @@ export class ProgressIndicator {
     return false;
   }
 
-  /** Stop all timers and clean up the indicator message (delete after a final "done" edit). */
+  /**
+   * Stop all timers and clean up the indicator message.
+   *
+   * - Streaming mode (方案B): the placeholder message is FINALIZED IN PLACE —
+   *   edited to the final reply (HTML-rendered when it fits the 4096 hard limit,
+   *   otherwise deleted + sent as separate chunks). We do NOT append a "✅ 完成"
+   *   line. The authoritative full reply text comes from the final
+   *   assistant/message event (`this.finalReplyText`), falling back to the
+   *   accumulated `text-delta` stream (`this.replyText`) if that event never
+   *   arrived. The finalize is delegated to `o.onFinalReply(chatId, text, {
+   *   messageThreadId, placeholderMessageId })`; when `placeholderMessageId` is
+   *   set the callback edits it in place (or deletes + chunk-sends on overflow).
+   * - Trail mode (default): delete the message after a brief "✅ 完成" edit.
+   */
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
     try { if (this.loop) clearInterval(this.loop); } catch { /* ignore */ }
     try {
+      if (this.streaming && typeof this.o.onFinalReply === 'function') {
+        const fullText = this.finalReplyText || this.replyText;
+        if (fullText.trim()) {
+          // onFinalReply edits the placeholder in place (HTML when it fits the
+          // 4096 limit) or deletes it and chunk-sends the reply; it returns
+          // true when it consumed the placeholder so we don't delete it again.
+          const consumed = await this.o.onFinalReply(this.o.chatId, fullText, {
+            messageThreadId: this.o.threadId,
+            placeholderMessageId: this.msgId,
+          });
+          if (consumed && this.msgId) this.msgId = null;
+        } else if (this.endedByTurnEnd && typeof this.o.onTurnError === 'function') {
+          // The turn ended but produced no reply text — most likely a provider /
+          // turn error (e.g. a 400 that aborts the whole request). Surface it to
+          // the phone instead of dropping silently (the failure mode that made the
+          // schema-400 bug invisible). Only when we stopped because of an actual
+          // turn/end, not when preempted by a newer turn or the timeout cap.
+          try { await this.o.onTurnError(this.o.chatId, { messageThreadId: this.o.threadId }); } catch { /* ignore */ }
+        }
+        // If the reply was empty or the callback did not consume the
+        // placeholder, remove the leftover indicator so we never show a stale
+        // "生成中" message.
+        if (this.msgId) {
+          try { await this.o.client.deleteMessage(this.o.chatId, this.msgId); } catch { /* ignore */ }
+          this.msgId = null;
+        }
+        return;
+      }
       if (this.msgId) {
         try { await this.o.client.editMessageText(this.o.chatId, this.msgId, '✅ 完成', undefined); } catch { /* ignore */ }
         try { await this.o.client.deleteMessage(this.o.chatId, this.msgId); } catch { /* ignore */ }
@@ -510,11 +670,15 @@ export class ProgressIndicator {
       const evts = this.o.agent?.session?.events;
       if (Array.isArray(evts)) {
         const done = this.processEvents(evts);
-        if (done) { await this.stop(); return; }
+        if (done) { this.endedByTurnEnd = true; await this.stop(); return; }
       }
       if (!this.msgId) {
-        // Only post the indicator once the turn has been going long enough.
-        if (Date.now() - this.o.startedAt >= this.o.delayMs) {
+        // Post the placeholder once (a) the activity trail has been going long
+        // enough, or (b) in streaming mode the reply itself has started — so
+        // the user watches the answer build from its first token, not only
+        // after the progress delay.
+        const replyStarted = this.streaming && this.replyText.length > 0;
+        if (replyStarted || Date.now() - this.o.startedAt >= this.o.delayMs) {
           await this.ensureMessage();
           if (this.msgId) await this.push(true);
         }
@@ -602,6 +766,22 @@ export async function apply(ctx, config) {
   const progressPerBlockChars = Math.max(40, Number(c.progressPerBlockChars) || 240);
   const progressMaxChars = Math.max(120, Number(c.progressMaxChars) || 1500);
   const progressTimeoutMs = Math.max(30, Number(c.progressTimeoutSec) || 3600) * 1000;
+
+  // Streaming reply (方案B) — direct mode only. The reply is shown building in
+  // place (placeholder edited as text-delta arrives) and finalized in place at
+  // turn end (HTML render, or chunked send on overflow).
+  const streamingReplyEnabled = c.streamingReply !== false;
+
+  // Inbound media download + forward (parity with QwenPaw).
+  const forwardInboundMedia = c.forwardInboundMedia !== false;
+  const inboundImageToModel = c.inboundImageToModel === true;
+  const inboundMediaDir =
+    (typeof c.inboundMediaDir === 'string' && c.inboundMediaDir.trim())
+      ? c.inboundMediaDir.trim()
+      : join(
+          process.env.DSH_HOME || join(process.env.HOME || process.env.USERPROFILE || '', '.dsh'),
+          'telegram-inbound',
+        );
 
   // Logging — prefer ctx.logger when the plugin is loaded inside a full DSH
   // host; fall back to console for unit tests or standalone loads.
@@ -835,7 +1015,16 @@ export async function apply(ctx, config) {
         await sleep(300);
       }
       if (!ready) {
-        log('warn', `Direct mode: no forwardable reply for chat ${chatId} (${gaveUpIdle ? 'agent idle without a fresh assistant message' : 'hit directReplyTimeoutSec cap'})`);
+        // Surface a turn failure (provider error, etc.) instead of staying
+        // silent — a silent drop is exactly what made the schema-400 bug
+        // invisible on the phone.
+        const notified = await notifyTurnFailure(agent, chatId, baseline, { replyToMessageId: telegramMessageId });
+        if (!notified) {
+          log('warn', `Direct mode: no forwardable reply for chat ${chatId} (${gaveUpIdle ? 'agent idle without a fresh assistant message' : 'hit directReplyTimeoutSec cap'})`);
+          try {
+            await sendText(String(chatId), `⚠️ 本次没有生成回复（${gaveUpIdle ? 'agent 空闲但无新回复' : '等待超时'}）。可重试，或到 Web 端查看。`, { replyToMessageId: telegramMessageId });
+          } catch (e) { log('error', 'Failed to send no-reply notice:', e.message); }
+        }
         return;
       }
 
@@ -870,6 +1059,191 @@ export async function apply(ctx, config) {
     return false;
   }
 
+  // Find the most recent turn/end at/after `baseline` and return its error
+  // object ({ message, code }) when the turn ended with reason.kind === 'error',
+  // else null. Used to surface provider/turn failures to the phone instead of
+  // dropping them silently.
+  function findTurnError(events, baseline) {
+    if (!Array.isArray(events)) return null;
+    for (let i = events.length - 1; i >= baseline; i--) {
+      const evt = events[i];
+      if (evt?.type !== 'turn/end') continue;
+      const reason = evt.data && evt.data.reason;
+      return reason && reason.kind === 'error' ? (reason.error || null) : null;
+    }
+    return null;
+  }
+
+  // Send a concise "turn failed" notice to a Telegram chat. Best-effort: returns
+  // true when a notice was sent, false otherwise (no turn error found / send failed).
+  async function notifyTurnFailure(agent, chatId, baseline, opts = {}) {
+    try {
+      const err = findTurnError(agent?.session?.events, baseline);
+      if (!err) return false;
+      const brief = String(err.message || err.code || 'unknown error').replace(/\s+/g, ' ').slice(0, 400);
+      const codeLine = err.code ? `\n<code>${escapeHtml(err.code)}</code>` : '';
+      log('error', `Turn ended with error for chat ${chatId}: ${err.message || err.code}`);
+      await sendText(String(chatId), `⚠️ 处理失败，未生成回复。${codeLine}\n${escapeHtml(brief)}`, {
+        replyToMessageId: opts.replyToMessageId,
+        messageThreadId: opts.messageThreadId,
+      });
+      return true;
+    } catch (e) {
+      log('error', 'Failed to send turn-failure notice:', e.message);
+      return false;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Streaming reply finalize (方案B). Called by the ProgressIndicator at
+  // turn/end when it is in streaming mode. The indicator has been showing the
+  // reply building in place (placeholder edited as text-delta arrives); here we
+  // FINALIZE that same message:
+  //   • if the HTML render fits in ONE Telegram message (≤ 4096 chars after
+  //     conversion) → edit the placeholder in place to the rendered reply;
+  //   • otherwise (too long, or the edit failed) → delete the placeholder and
+  //     send the reply as normal (fence-aware chunked) messages.
+  // Returns true when the placeholder's fate is fully handled (edit-in-place or
+  // delete+resend) so the indicator does not double-delete it; false when it did
+  // nothing useful (empty reply / no placeholder / send failed) so the indicator
+  // cleans the placeholder up.
+  // -----------------------------------------------------------------------
+  async function finalizeStreamingReply(chatId, rawText, opts = {}) {
+    const { placeholderMessageId, messageThreadId } = opts;
+    const prefixed = replyPrefix ? `${replyPrefix}\n${rawText}` : rawText;
+    if (!prefixed.trim()) return false;
+
+    // Preferred: edit the placeholder in place with an HTML render, but only
+    // when the converted text fits in a single message (guardConvertedLength
+    // reports useParseMode:false when the HTML would exceed the 4096 limit).
+    if (placeholderMessageId) {
+      const guarded = guardConvertedLength(prefixed, markdownToTelegramHtml(prefixed), 4096);
+      if (guarded.useParseMode) {
+        try {
+          const ok = await client.editMessageText(chatId, placeholderMessageId, guarded.text, 'HTML');
+          if (ok) {
+            log('info', `Streaming reply finalized in place for chat ${chatId}`);
+            return true;
+          }
+        } catch (err) {
+          log('warn', `Streaming finalize: in-place edit failed (${err.message}); falling back to send`);
+        }
+      }
+      // Overflow / edit failure: remove the placeholder so it doesn't linger.
+      try { await client.deleteMessage(chatId, placeholderMessageId); } catch { /* ignore */ }
+    }
+
+    // Fallback: normal (chunked) delivery, replying into the same thread.
+    try {
+      await sendText(String(chatId), prefixed, { messageThreadId });
+      log('info', `Streaming reply sent (chunked) for chat ${chatId}`);
+      return true;
+    } catch (err) {
+      log('error', 'Streaming finalize send failed:', err.message);
+      return false;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Inbound media download + forward (parity with QwenPaw). When the user
+  // sends a photo/document/video/audio/voice we:
+  //   1. download it to `inboundMediaDir` (uuid-named), and
+  //   2. tell the agent the LOCAL PATH so it can read it with its file tools
+  //      (bash/read/glob), plus any caption.
+  // For photos we MAY ALSO attach a vision content block so a multimodal model
+  // can "see" it — but only when `inboundImageToModel` is true (default false:
+  // a text-only model would throw UNSUPPORTED_CONTENT on an image block and
+  // break the whole turn). If the attachments service is missing or saveImage
+  // fails (wrong media type / model policy), we degrade to path-only and log.
+  // -----------------------------------------------------------------------
+  function inboundMediaKind(message) {
+    return message.photo ? 'photo'
+      : message.document ? 'document'
+      : message.video ? 'video'
+      : message.audio ? 'audio'
+      : message.voice ? 'voice'
+      : 'media';
+  }
+
+  /** Pick the downloadable file_id for an inbound media message (or null). */
+  function inboundMediaFileId(message) {
+    if (message.photo && message.photo.length) {
+      // Photos come as several sizes; take the LARGEST (most detail).
+      const largest = message.photo.reduce((a, b) =>
+        ((a.width * a.height) >= (b.width * b.height) ? a : b));
+      return largest.fileId || null;
+    }
+    const m = message.document || message.video || message.audio || message.voice;
+    return (m && m.file_id) ? m.file_id : null;
+  }
+
+  /**
+   * Download an inbound media message and build a note (+ optional vision
+   * block) describing it for the agent. Always returns { note, imageBlock }.
+   * Best-effort: never throws — a download failure becomes a descriptive note.
+   */
+  async function downloadAndDescribeInboundMedia(message) {
+    const kind = inboundMediaKind(message);
+    const fileId = inboundMediaFileId(message);
+    if (!fileId) {
+      return { note: `(the user sent a ${kind} with no downloadable file)`, imageBlock: null };
+    }
+    let dl;
+    try {
+      dl = await client.downloadFile(fileId, inboundMediaDir);
+    } catch (err) {
+      log('warn', `Inbound ${kind} download failed: ${err.message}`);
+      return { note: `(the user sent a ${kind} but it could not be downloaded: ${err.message})`, imageBlock: null };
+    }
+
+    // Human/agent-facing description.
+    let dims = '';
+    if (message.photo && message.photo.length) {
+      const p = message.photo.reduce((a, b) =>
+        ((a.width * a.height) >= (b.width * b.height) ? a : b));
+      if (p.width && p.height) dims = ` (${p.width}×${p.height})`;
+    }
+    const raw = message.document || message.video || message.audio || message.voice;
+    let meta = '';
+    if (raw && raw.file_name) meta += ` “${raw.file_name}”`;
+    if (raw && typeof raw.file_size === 'number') meta += ` ${Math.round(raw.file_size / 1024)} KB`;
+    if (raw && typeof raw.duration === 'number') meta += ` ${raw.duration}s`;
+
+    const note =
+      `The user sent a ${kind}${dims}${meta}. ` +
+      `It has been saved locally to: ${dl.localPath} — you can read/process it with your file tools.` +
+      (message.text ? ` Their caption: “${message.text}”` : '');
+
+    // Optional vision block (photos only, and only when explicitly enabled).
+    // The declared media type must match the ACTUAL bytes (saveImage validates
+    // by decoding), so we sniff the magic bytes rather than assume jpeg.
+    let imageBlock = null;
+    if (kind === 'photo' && inboundImageToModel) {
+      const svc =
+        (ctx.attachments && typeof ctx.attachments.saveImage === 'function')
+          ? ctx.attachments
+          : (ctx.get ? ctx.get('attachments') : undefined);
+      if (!svc || typeof svc.saveImage !== 'function') {
+        log('warn', 'Inbound photo: attachments service unavailable; forwarding path only.');
+      } else {
+        try {
+          const bytes = new Uint8Array(readFileSync(dl.localPath));
+          const mediaType = sniffImageMediaType(bytes);
+          if (!mediaType) {
+            log('warn', 'Inbound photo: bytes are not a supported raster (png/jpeg/webp/gif); forwarding path only.');
+          } else {
+            const ref = await svc.saveImage({ data: bytes, mediaType, name: dl.fileName });
+            imageBlock = { type: 'image', attachment: ref };
+            log('info', `Inbound photo attached as vision block (${ref.mediaType}, ${ref.bytes} bytes).`);
+          }
+        } catch (err) {
+          log('warn', `Inbound photo: saveImage failed (${err.code || err.message}); forwarding path only.`);
+        }
+      }
+    }
+    return { note, imageBlock };
+  }
+
   // -----------------------------------------------------------------------
   // Progress indicator wiring (module-scope class + helpers above). A chat has
   // at most one indicator at a time — the plugin routes each chat to a single
@@ -886,6 +1260,11 @@ export async function apply(ctx, config) {
       // busy) — stop it before starting a fresh one for this turn.
       void prev.stop();
     }
+    // Streaming reply (方案B): only in 'direct' mode (where the plugin owns
+    // delivery) and when enabled. In 'tool' mode the agent sends via
+    // telegram_send_message itself, so the indicator must NOT also send the
+    // reply.
+    const streaming = streamingReplyEnabled && agentResponseMode === 'direct';
     const ind = new ProgressIndicator({
       chatId,
       threadId,
@@ -899,6 +1278,9 @@ export async function apply(ctx, config) {
       perBlockChars: progressPerBlockChars,
       maxChars: progressMaxChars,
       timeoutMs: progressTimeoutMs,
+      streaming,
+      onFinalReply: streaming ? (cid, text, o) => finalizeStreamingReply(cid, text, o) : undefined,
+      onTurnError: streaming ? (cid, o) => notifyTurnFailure(agent, cid, baseline, { messageThreadId: o.messageThreadId }) : undefined,
     });
     activeIndicators.set(chatKey, ind);
     ind.start();
@@ -1102,6 +1484,153 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       });
 
       return `Document sent successfully (message_id: ${result.messageId})`;
+    },
+  });
+
+  // -----------------------------------------------------------------------
+  // Tool: telegram_send_video
+  // -----------------------------------------------------------------------
+
+  registerTool({
+    name: 'telegram_send_video',
+    description: 'Send a video to a Telegram chat. The video parameter can be a Telegram file_id (previously uploaded) or a public URL.',
+
+    parameters: {
+      chat_id: {
+        type: 'string',
+        description: 'Target Telegram chat ID.',
+      },
+      video: {
+        type: 'string',
+        required: true,
+        description: 'Telegram file_id or public URL of the video.',
+      },
+      caption: {
+        type: 'string',
+        description: 'Optional video caption.',
+      },
+      parse_mode: {
+        type: 'string',
+        enum: ['HTML', 'Markdown'],
+        description: 'Parse mode for the caption.',
+      },
+      message_thread_id: {
+        type: 'integer',
+        description: 'For forum topics: the thread ID.',
+      },
+    },
+
+    async execute(args, exec) {
+      if (!client) {
+        throw new Error('Telegram bot is not configured.');
+      }
+      const chatId = args.chat_id || defaultChatId;
+      if (!chatId) {
+        throw new Error('chat_id is required.');
+      }
+
+      let caption;
+      let captionParseMode = args.parse_mode || parseMode;
+      if (args.caption) {
+        if (captionParseMode === 'Markdown') {
+          caption = args.caption;
+        } else {
+          const guarded = guardConvertedLength(args.caption, markdownToTelegramHtml(args.caption), 1024);
+          caption = guarded.text;
+          if (!guarded.useParseMode) captionParseMode = undefined;
+        }
+      }
+
+      const result = await client.sendVideo({
+        chatId,
+        video: args.video,
+        caption,
+        parseMode: captionParseMode,
+        messageThreadId: args.message_thread_id,
+      });
+
+      return `Video sent successfully (message_id: ${result.messageId})`;
+    },
+  });
+
+  // -----------------------------------------------------------------------
+  // Tool: telegram_send_audio
+  // -----------------------------------------------------------------------
+
+  registerTool({
+    name: 'telegram_send_audio',
+    description: 'Send an audio file (music, podcast, etc.) to a Telegram chat. The audio parameter can be a Telegram file_id or a public URL.',
+
+    parameters: {
+      chat_id: {
+        type: 'string',
+        description: 'Target Telegram chat ID.',
+      },
+      audio: {
+        type: 'string',
+        required: true,
+        description: 'Telegram file_id or public URL of the audio file.',
+      },
+      caption: {
+        type: 'string',
+        description: 'Optional audio caption.',
+      },
+      track_title: {
+        type: 'string',
+        description: 'Optional track title.',
+      },
+      performer: {
+        type: 'string',
+        description: 'Optional performer name.',
+      },
+      duration: {
+        type: 'integer',
+        description: 'Optional duration in seconds.',
+      },
+      parse_mode: {
+        type: 'string',
+        enum: ['HTML', 'Markdown'],
+        description: 'Parse mode for the caption.',
+      },
+      message_thread_id: {
+        type: 'integer',
+        description: 'For forum topics: the thread ID.',
+      },
+    },
+
+    async execute(args, exec) {
+      if (!client) {
+        throw new Error('Telegram bot is not configured.');
+      }
+      const chatId = args.chat_id || defaultChatId;
+      if (!chatId) {
+        throw new Error('chat_id is required.');
+      }
+
+      let caption;
+      let captionParseMode = args.parse_mode || parseMode;
+      if (args.caption) {
+        if (captionParseMode === 'Markdown') {
+          caption = args.caption;
+        } else {
+          const guarded = guardConvertedLength(args.caption, markdownToTelegramHtml(args.caption), 1024);
+          caption = guarded.text;
+          if (!guarded.useParseMode) captionParseMode = undefined;
+        }
+      }
+
+      const result = await client.sendAudio({
+        chatId,
+        audio: args.audio,
+        caption,
+        parseMode: captionParseMode,
+        title: args.track_title,
+        performer: args.performer,
+        duration: args.duration,
+        messageThreadId: args.message_thread_id,
+      });
+
+      return `Audio sent successfully (message_id: ${result.messageId})`;
     },
   });
 
@@ -1569,11 +2098,10 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
     async function handleCommands(message) {
       // Returns true when the message was a command (already handled).
-      const text = message.text?.trim() ?? '';
-      if (!text.startsWith('/')) return false;
+      const extracted = await extractCommand(message);
+      if (!extracted) return false;
+      const { cmd, args } = extracted;
       const chatId = String(message.chatId);
-      const [cmd, ...rest] = text.split(/\s+/);
-      const args = rest.join(' ').trim();
       const agentsSvc = ctx.get?.('agents');
       const all = agentsSvc?.list?.() ?? [];
       const active = resolveChatAgent(chatId);
@@ -1812,7 +2340,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       const dedupKey = `${message.chatId}:${message.messageId}`;
       if (injectedIds.has(dedupKey)) return;
 
-      if (message.text) {
+      const hasMedia = !!(message.photo || message.document || message.video
+        || message.audio || message.voice);
+      if (message.text || hasMedia) {
         // Show typing action
         await client.sendChatAction(message.chatId, 'typing', message.messageThreadId);
 
@@ -1821,6 +2351,17 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
         if (injectToAgent && currentAgent) {
           try {
+            // Inbound media: download + forward the LOCAL PATH to the agent so
+            // it can read/process the file with its tools. (A photo MAY also be
+            // attached as a vision block when inboundImageToModel is on.)
+            let mediaNote = '';
+            let imageBlock = null;
+            if (hasMedia && forwardInboundMedia) {
+              const fm = await downloadAndDescribeInboundMedia(message);
+              mediaNote = fm.note;
+              imageBlock = fm.imageBlock;
+            }
+
             // DSH's MessageSource requires kind ∈ {user, plugin, model, tool}.
             // Use 'plugin' (this plugin is the source of the message) and
             // keep the chat id in the text so the agent can route replies.
@@ -1828,17 +2369,20 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
               agentResponseMode === 'direct'
                 ? `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Produce your answer as normal assistant text; the plugin will forward it back to Telegram automatically. Do NOT call telegram_send_message.`
                 : `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Reply to it using the telegram_send_message tool with chat_id: ${message.chatId}.`;
+
+            const bodyParts = [];
+            if (message.text) {
+              bodyParts.push(`[Telegram message from ${sender} in chat ${message.chatId}]\n${message.text}`);
+            }
+            if (hasMedia) {
+              bodyParts.push(forwardInboundMedia ? mediaNote : `The user sent a ${inboundMediaKind(message)}.`);
+            }
+            bodyParts.push(replyInstruction);
+            const textBlock = { type: 'text', text: bodyParts.join('\n\n') };
+
             const userMessage = {
               role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text: `[Telegram message from ${sender} in chat ${message.chatId}]
-${message.text}
-
-${replyInstruction}`,
-                },
-              ],
+              content: imageBlock ? [imageBlock, textBlock] : [textBlock],
               source: {
                 kind: 'plugin',
                 plugin: name,
@@ -1870,8 +2414,10 @@ ${replyInstruction}`,
             // response modes; it self-cleans when the turn ends.
             startProgressForAgent(currentAgent, message.chatId, baseline, message.messageThreadId);
 
-            if (agentResponseMode === 'direct') {
+            if (agentResponseMode === 'direct' && !streamingReplyEnabled) {
               // Auto-capture the agent's final text for this turn and send it.
+              // (When streaming is enabled the ProgressIndicator finalizes the
+              // reply in place — see onFinalReply — so we must NOT double-send.)
               void watchDirectReply(currentAgent, message.chatId, message.messageId);
             }
             return;
@@ -1882,36 +2428,18 @@ ${replyInstruction}`,
           log('info', 'Agent injection enabled but no agent available yet');
         }
 
-        // Fallback: direct echo response if not injecting to agent.
-        const responseText = `Received your message: "${message.text?.slice(0, 100)}"`;
+        // Fallback (no agent / injection off): brief echo so the user knows
+        // the bot saw it.
+        const echoText = message.text
+          ? `Received your message: "${message.text.slice(0, 100)}"`
+          : `I received a ${inboundMediaKind(message)}.`;
         await client.sendMessage({
           chatId: message.chatId,
-          text: responseText,
+          text: echoText,
           parseMode: parseMode,
           replyToMessageId: message.messageId,
           messageThreadId: message.messageThreadId,
         });
-      } else {
-        // Non-text inbound media: acknowledge with a brief receipt so the
-        // user knows the bot saw it (the message itself is not forwarded to
-        // the agent yet — that would require attachment plumbing).
-        const kind = message.photo ? 'photo'
-          : message.document ? 'document'
-          : message.video ? 'video'
-          : message.audio ? 'audio'
-          : message.voice ? 'voice'
-          : 'media';
-        try {
-          await client.sendMessage({
-            chatId: message.chatId,
-            text: `I received a ${kind} (message_id: ${message.messageId}). Text-only interaction is currently supported.`,
-            parseMode: undefined,
-            replyToMessageId: message.messageId,
-            messageThreadId: message.messageThreadId,
-          });
-        } catch (err) {
-          log('warn', 'Failed to send media ack:', err.message);
-        }
       }
     });
 

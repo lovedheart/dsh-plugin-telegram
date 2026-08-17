@@ -220,6 +220,88 @@ await test('no indicator posted for a turn that ends immediately', async () => {
   assert.equal(ind.stopped, true, 'indicator stopped');
 });
 
+// ---- Streaming reply (方案B) ---------------------------------------------
+// In streaming mode the SAME indicator message shows the final reply as it
+// builds (text-delta) and is finalized in place at turn end via onFinalReply.
+
+console.log('\nstreaming reply (方案B):');
+await test('text-delta accumulates into replyText (streaming mode)', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'Hello ' } } });
+  ind.processEvent({ seq: 2, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'world' } } });
+  assert.equal(ind.replyText, 'Hello world');
+});
+await test('text-delta is NOT accumulated when streaming is disabled', () => {
+  const ind = new ProgressIndicator(makeOpts()); // streaming off
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'Hello' } } });
+  assert.equal(ind.replyText, '', 'no replyText without streaming');
+});
+await test('buildTraceText switches to 回复（生成中） with the reply tail', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, maxChars: 200 }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'The answer is 42.' } } });
+  const text = ind.buildTraceText();
+  assert.ok(text.includes('💬 回复（生成中）'), text);
+  assert.ok(text.includes('The answer is 42.'), text);
+});
+await test('streaming reply is tail-truncated to maxChars', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, maxChars: 10 }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'AAAAAAAAAATRAIL' } } });
+  const text = ind.buildTraceText();
+  // Header + ellipsis + last 10 chars.
+  assert.ok(text.includes('…'), text);
+  assert.ok(text.endsWith('RAIL') || text.includes('TRAIL'), text);
+  const body = text.replace('💬 回复（生成中）\n', '');
+  assert.ok(body.length <= 11, `body too long: ${body.length}`);
+});
+await test('assistant/message captures the authoritative final text', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'partial' } } });
+  ind.processEvent({
+    seq: 2, type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: 'The FINAL answer.' }, { type: 'tool-call', name: 'x' }] } },
+  });
+  assert.equal(ind.finalReplyText, 'The FINAL answer.');
+  // The final text takes precedence over the accumulated deltas.
+  assert.ok(ind.finalReplyText !== ind.replyText);
+});
+await test('stop() finalizes via onFinalReply and does NOT delete the placeholder when consumed', async () => {
+  const client = makeClient();
+  const onFinalCalls = [];
+  const onFinal = async (chatId, text, o) => { onFinalCalls.push({ chatId, text, o }); return true; };
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, client, onFinalReply: onFinal }));
+  // Simulate a posted placeholder + streamed reply.
+  ind.msgId = 777;
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'Done!' } } });
+  await ind.stop();
+  assert.equal(onFinalCalls.length, 1, 'onFinalReply called once');
+  assert.equal(onFinalCalls[0].chatId, '123');
+  assert.equal(onFinalCalls[0].text, 'Done!');
+  assert.equal(onFinalCalls[0].o.placeholderMessageId, 777, 'placeholder id forwarded');
+  // Consumed → the indicator must NOT delete the (now final) message.
+  assert.equal(client.calls.deletes.length, 0, 'placeholder not deleted (consumed)');
+});
+await test('stop() deletes the leftover placeholder when onFinalReply does not consume', async () => {
+  const client = makeClient();
+  const onFinal = async () => false; // did not consume
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, client, onFinalReply: onFinal }));
+  ind.msgId = 888;
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'partial' } } });
+  await ind.stop();
+  assert.equal(client.calls.deletes.length, 1, 'leftover placeholder deleted');
+  assert.equal(client.calls.deletes[0], 888);
+});
+await test('stop() with no reply text just deletes the placeholder (no onFinalReply call)', async () => {
+  const client = makeClient();
+  let called = 0;
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, client, onFinalReply: async () => { called++; return true; } }));
+  ind.msgId = 999;
+  // Only reasoning, no text-delta → no final reply.
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'hmm' } } });
+  await ind.stop();
+  assert.equal(called, 0, 'onFinalReply not called when there is no reply');
+  assert.equal(client.calls.deletes.length, 1, 'placeholder deleted');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
 })();

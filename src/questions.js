@@ -96,6 +96,12 @@ export function buildQuestionCard(questions, escape, selections = new Map()) {
     if (q.multiSelect) {
       const chosen = selections.get(q.id) || [];
       parts.push(chosen.length ? `🔘 已选：${esc(chosen.join('，'))}` : `🔘 可多选，选完点「✅ 提交」`);
+    } else if (multi) {
+      // Single-select inside a multi-question card: show the current choice so
+      // the user can see it before hitting 提交 (a single-question card submits
+      // on tap, so it needs no status line).
+      const chosen = selections.get(q.id) || [];
+      parts.push(chosen.length ? `🔘 已选：${esc(chosen.join('，'))}` : `🔘 未选择`);
     }
   });
 
@@ -309,10 +315,21 @@ export function createQuestionModule(deps) {
         deps.client.editMessageText(entry.chatId, entry.cardMessageId, text, 'HTML').catch(() => {});
       }
     } else {
-      await ack('✅');
-      // Single-select: the tap IS the answer.
       entry.selections.set(q.id, [label]);
-      await answer(entry, {});
+      if (entry.questions.length === 1) {
+        // Single-question card: the tap IS the answer — submit immediately.
+        await ack('✅');
+        await answer(entry, {});
+      } else {
+        // Multi-question card: only record the choice; wait for 提交. Without
+        // this guard a single-select tap would submit the whole card and any
+        // remaining (e.g. multi-select) questions would be silently skipped.
+        await ack('🔘');
+        const { text } = buildQuestionCard(entry.questions, deps.escape, entry.selections);
+        if (entry.cardMessageId) {
+          deps.client.editMessageText(entry.chatId, entry.cardMessageId, text, 'HTML').catch(() => {});
+        }
+      }
     }
     return true;
   }

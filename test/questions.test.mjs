@@ -270,6 +270,35 @@ await test('multiSelect toggles selection, submit sends all selected labels', as
   assert.deepEqual(a.selected.sort(), ['X', 'Y']);
 });
 
+// Regression: a single-select tap on a MULTI-question card must NOT submit the
+// whole card (the old bug: it answered only Q1 and silently skipped Q2). It
+// should record the choice + re-edit the card, and only submit via 提交.
+console.log('\ncreateQuestionModule: multi-question single-select (regression)');
+await test('multi-question card: single-select tap records, does NOT submit', async () => {
+  const { mod, client, state } = makeModule();
+  const q1 = { id: 'lang', question: '选哪种语言？', options: [{ label: '中文' }, { label: 'English' }] };
+  const q2 = { id: 'topic', question: '选哪些主题？', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }] };
+  const kb = await request(mod, client, 'rpc-mq', 'telegram-abc', [q1, q2]);
+  // Tap Q1 "English" (q0:1) — single-select on a multi-question card.
+  const editsBefore = client.calls.edits.length;
+  await mod.handleCallbackQuery({ id: 'mq1', data: btn(kb, ':q0:1').callback_data });
+  await sleep(1);
+  // BUG FIX: must NOT have submitted the whole card.
+  assert.equal(state.responses.length, 0, 'single-select tap on a multi-question card must not submit');
+  // It re-edited the card to show the selection.
+  assert.ok(client.calls.edits.length > editsBefore, 'card was re-edited to reflect the choice');
+  // Now answer Q2 (multi) and submit.
+  await mod.handleCallbackQuery({ id: 'mq2', data: btn(kb, ':q1:0').callback_data });
+  await mod.handleCallbackQuery({ id: 'mq3', data: btn(kb, ':submit').callback_data });
+  await sleep(1);
+  assert.equal(state.responses.length, 1);
+  const answers = state.responses[0].result.value.answer.answers;
+  const lang = answers.find((x) => x.id === 'lang');
+  const topic = answers.find((x) => x.id === 'topic');
+  assert.deepEqual(lang.selected, ['English']);
+  assert.deepEqual(topic.selected, ['A']);
+});
+
 console.log('\ncreateQuestionModule: ownership + replay + web-first');
 await test('questions for a web agent (ownership null) are ignored', async () => {
   const { mod, client, state } = makeModule();
