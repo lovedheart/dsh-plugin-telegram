@@ -179,6 +179,15 @@ await test('multi-question flow: each question card pairs its question with its 
   assert.ok(!c0.keyboard.flat().some((b) => b.callback_data.endsWith(':submit')));
 });
 
+await test('header appears exactly once per card (regression: printed twice)', () => {
+  const count = (s, sub) => s.split(sub).length - 1;
+  const q = { id: 'a', header: '第1题（多选）', question: '一？', options: [{ label: 'A1' }] };
+  const single = buildQuestionCard([q], esc);
+  assert.equal(count(single.text, '第1题（多选）'), 1, 'single-question card header once');
+  const per = buildQuestionCardFor(q, 0, 2, esc);
+  assert.equal(count(per.text, '第1题（多选）'), 1, 'per-question card header once');
+});
+
 await test('summary card shows progress and the final submit button', () => {
   const entry = {
     questions: [
