@@ -8,6 +8,9 @@ import {
   createQuestionModule,
   parseSseFrames,
   createMuxSubscriber,
+  displayWidth,
+  buttonsPerRow,
+  effectiveMultiSelect,
 } from '../src/questions.js';
 
 let passed = 0, failed = 0;
@@ -40,7 +43,7 @@ function makeClient(overrides = {}) {
       if (overrides.failSend) throw overrides.failSend(opts);
       return { messageId: ++nextId, chatId: String(opts.chatId) };
     },
-    async editMessageText(chatId, id, text, parseMode) { calls.edits.push({ chatId, id, text }); return true; },
+    async editMessageText(chatId, id, text, parseMode, replyMarkup) { calls.edits.push({ chatId, id, text, replyMarkup }); return true; },
     async answerCallbackQuery(id, text) { calls.acks.push({ id, text }); return true; },
   };
 }
@@ -186,6 +189,81 @@ await test('empty options -> option text falls back to 选项 N', () => {
   assert.equal(btn.text, '选项 1');
 });
 
+await test('long CJK labels get one button per row (no phone clipping)', () => {
+  const q = { id: 'cs', question: '以下哪些说法是正确的？（可多选）', multiSelect: true, options: [
+    { label: 'A. 地球自转一圈大约需要一天' },
+    { label: 'B. 高海拔地区水的沸点比海平面低' },
+    { label: 'C. 常温下声速在空气中约 340 米/秒' },
+    { label: 'D. 空气中氧气含量比氮气多' },
+  ] };
+  const { keyboard } = buildQuestionCard([q], esc);
+  // Option rows (exclude the trailing submit/cancel row): each must hold 1 button.
+  const optRows = keyboard.filter((row) => row.some((b) => b.callback_data.includes(':q0:')));
+  assert.equal(optRows.length, 4);
+  for (const row of optRows) assert.equal(row.length, 1);
+  // callback_data indices stay aligned with option order despite re-packing.
+  assert.deepEqual(optRows.map((r) => r[0].callback_data.slice(-1)), ['0', '1', '2', '3']);
+});
+
+await test('short labels still share a row', () => {
+  const { keyboard } = buildQuestionCard([{ id: 's', question: 'q', options: [{ label: '是' }, { label: '否' }, { label: 'OK' }, { label: 'No' }] }], esc);
+  const optRows = keyboard.filter((row) => row.some((b) => b.callback_data.includes(':q0:')));
+  assert.equal(optRows.length, 1);
+  assert.equal(optRows[0].length, 4);
+});
+
+await test('medium CJK labels pack two per row', () => {
+  // 10 CJK chars = 20 display units -> buttonsPerRow(20) === 2
+  const mk = (p) => ({ label: p + '一二三四五六七八九' });
+  const { keyboard } = buildQuestionCard([{ id: 'm', question: 'q', options: [mk('甲'), mk('乙'), mk('丙'), mk('丁')] }], esc);
+  const optRows = keyboard.filter((row) => row.some((b) => b.callback_data.includes(':q0:')));
+  assert.equal(optRows.length, 2);
+  assert.ok(optRows.every((r) => r.length === 2));
+});
+
+await test('option descriptions render in the body, numbered by button order', () => {
+  const q = { id: 'd2', question: '主问题', options: [
+    { label: 'A. 地球自转一圈大约需要一天', description: '地球自转一周约需 24 小时' },
+    { label: 'B. 无说明项' },
+    { label: 'C. 常温下声速在空气中约 340 米/秒', description: '声音在空气中传播速度约为 340 m/s（常温）' },
+  ] };
+  const { text } = buildQuestionCard([q], esc);
+  assert.ok(text.includes('📝 选项说明（按按钮顺序）：'));
+  assert.ok(text.includes('1. A. 地球自转一圈大约需要一天：地球自转一周约需 24 小时'));
+  assert.ok(text.includes('3. C. 常温下声速在空气中约 340 米/秒：声音在空气中传播速度约为 340 m/s（常温）'));
+  assert.ok(!text.includes('2.'), 'options without a description get no line');
+});
+
+await test('displayWidth / buttonsPerRow thresholds', () => {
+  assert.equal(displayWidth('abc'), 3);
+  assert.equal(displayWidth('中文'), 4);
+  assert.equal(displayWidth('a中b'), 4);
+  assert.equal(buttonsPerRow(10), 4);
+  assert.equal(buttonsPerRow(12), 4);
+  assert.equal(buttonsPerRow(13), 3);
+  assert.equal(buttonsPerRow(16), 3);
+  assert.equal(buttonsPerRow(17), 2);
+  assert.equal(buttonsPerRow(24), 2);
+  assert.equal(buttonsPerRow(25), 1);
+});
+
+await test('effectiveMultiSelect: explicit boolean always wins', () => {
+  assert.equal(effectiveMultiSelect({ multiSelect: true, question: '选哪种？' }), true);
+  // Explicit false is respected even when the wording looks multi — we never
+  // override a deliberate model choice.
+  assert.equal(effectiveMultiSelect({ multiSelect: false, question: '以下哪些（多选）？' }), false);
+});
+
+await test('effectiveMultiSelect: infers from wording only when flag is absent', () => {
+  // The real-world bug: model wrote "（多选）" but omitted multi_select.
+  assert.equal(effectiveMultiSelect({ question: '以下哪些说法是正确的？（多选）' }), true);
+  assert.equal(effectiveMultiSelect({ header: '常识多选题', question: '哪些是正确的' }), true);
+  assert.equal(effectiveMultiSelect({ question: 'Which of these apply? (multiple select)' }), true);
+  // Single-select wording with no flag stays single.
+  assert.equal(effectiveMultiSelect({ question: '选哪种语言？' }), false);
+  assert.equal(effectiveMultiSelect({ question: '请选择一个' }), false);
+});
+
 // ---------------------------------------------------------------------------
 // createQuestionModule — answer flows
 // ---------------------------------------------------------------------------
@@ -258,6 +336,13 @@ await test('multiSelect toggles selection, submit sends all selected labels', as
   const kb = await request(mod, client, 'rpc-5', 'telegram-abc', [q]);
   // Tap X
   await mod.handleCallbackQuery({ id: 'm1', data: btn(kb, ':q0:0').callback_data });
+  // The refresh edit must re-send the keyboard (incl. the ✅ submit row) so
+  // clients re-render it — a text-only edit hid the submit button on the phone.
+  const refreshEdit = client.calls.edits[client.calls.edits.length - 1];
+  assert.ok(refreshEdit.replyMarkup?.inline_keyboard?.length >= 2, 'refresh edit re-sends keyboard');
+  const lastRow = refreshEdit.replyMarkup.inline_keyboard.at(-1);
+  assert.ok(lastRow.some((b) => b.text === '✅ 提交'), 'submit button present in refreshed keyboard');
+  assert.ok(refreshEdit.text.includes('✅ 提交'), 'refreshed text keeps the submit hint after selecting');
   // Tap Y
   await mod.handleCallbackQuery({ id: 'm2', data: btn(kb, ':q0:1').callback_data });
   // No answer yet (needs submit)
@@ -268,6 +353,33 @@ await test('multiSelect toggles selection, submit sends all selected labels', as
   assert.equal(state.responses.length, 1);
   const a = state.responses[0].result.value.answer.answers[0];
   assert.deepEqual(a.selected.sort(), ['X', 'Y']);
+});
+
+// Regression: model wrote a "（多选）" question but OMITTED multi_select: true.
+// The card must still behave as multi-select (no auto-submit on first tap), not
+// fall through to the single-select "tap = answer" path.
+console.log('\ncreateQuestionModule: multi-select inferred from wording (regression)');
+await test('single question with missing multiSelect flag + "（多选）" text does NOT auto-submit', async () => {
+  const { mod, client, state } = makeModule();
+  // NOTE: no `multiSelect` field — mirrors the real frame the model sent.
+  const q = { id: 'quiz', header: '常识多选题', question: '以下哪些说法是正确的？（多选）', options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }] };
+  const kb = await request(mod, client, 'rpc-infer', 'telegram-abc', [q]);
+  // Card must show a submit button (needsSubmit) because it's treated as multi.
+  assert.ok(kb.flat().some((b) => b.text === '✅ 提交'), 'inferred multi-select card has a submit button');
+  // Tap A → must NOT submit (still pending).
+  await mod.handleCallbackQuery({ id: 'inf1', data: btn(kb, ':q0:0').callback_data });
+  await sleep(1);
+  assert.equal(state.responses.length, 0, 'first tap on an inferred multi-select must not auto-submit');
+  // Card re-edited to show the selection + keep the submit hint.
+  const lastEdit = client.calls.edits[client.calls.edits.length - 1];
+  assert.ok(lastEdit.text.includes('已选'), 'selection reflected');
+  assert.ok(lastEdit.replyMarkup?.inline_keyboard?.some((row) => row.some((b) => b.text === '✅ 提交')), 'submit button still present');
+  // Tap B, then submit → both labels returned.
+  await mod.handleCallbackQuery({ id: 'inf2', data: btn(kb, ':q0:1').callback_data });
+  await mod.handleCallbackQuery({ id: 'inf3', data: btn(kb, ':submit').callback_data });
+  await sleep(1);
+  assert.equal(state.responses.length, 1);
+  assert.deepEqual(state.responses[0].result.value.answer.answers[0].selected.sort(), ['A', 'B']);
 });
 
 // Regression: a single-select tap on a MULTI-question card must NOT submit the
@@ -405,51 +517,58 @@ await test('handles multiple frames in one buffer', () => {
 });
 
 // ---------------------------------------------------------------------------
-// createMuxSubscriber — integration with a fake global fetch (SSE stream)
+// createMuxSubscriber — integration with a fake global WebSocket.
+// The real mux endpoint is WebSocket-only (HTTP GET → 426 Upgrade Required);
+// each server message is one JSON text frame { type:'server-request', rpcId,
+// method, payload }. The downlink is read-only.
 // ---------------------------------------------------------------------------
 
-console.log('\ncreateMuxSubscriber (fake fetch):');
-await test('feeds question frames to onFrame and stop() halts it', async () => {
-  const realFetch = globalThis.fetch;
+console.log('\ncreateMuxSubscriber (fake WebSocket):');
+await test('feeds question frames to onFrame and stop() closes the socket', async () => {
+  const RealWebSocket = globalThis.WebSocket;
   const received = [];
-  let aborted = false;
-  const enc = new TextEncoder();
-  // Real frame shape: { type, rpcId, method, payload } — rpcId sits at the
-  // ROOT, payload carries the question details.
-  const chunk1 = enc.encode(`: connected\ndata: {"type":"server-request","rpcId":"r1","method":"question/requested","payload":{"type":"question/requested","sessionId":"telegram-x","questions":[{"id":"a","question":"q","options":[{"label":"L"}]}]}}\n\n`);
-  const chunk2 = enc.encode(`data: {"type":"server-request","rpcId":"r1","payload":{"type":"question/resolved","questionRpcId":"r1","outcome":"answered"}}\n\n`);
-  globalThis.fetch = async (url, opts) => {
-    assert.ok(String(url).endsWith('/api/events.mux'));
-    return {
-      ok: true,
-      body: (async function* () {
-        yield chunk1;
-        yield chunk2;
-        // Stay open (like a real SSE stream) until the controller aborts, so
-        // the test is deterministic — the subscriber only leaves via stop().
-        if (opts.signal) {
-          if (opts.signal.aborted) return;
-          await new Promise((resolve) => opts.signal.addEventListener('abort', resolve, { once: true }));
-          aborted = true;
-        }
-      })(),
-    };
-  };
+  let closedByStop = false;
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this._listeners = {};
+      FakeWebSocket.last = this;
+    }
+    addEventListener(type, fn) { (this._listeners[type] ||= []).push(fn); }
+    _emit(type, ev) { for (const fn of [...(this._listeners[type] || [])]) fn(ev); }
+    close() { closedByStop = true; this._emit('close', { code: 1000 }); }
+    // Test helpers simulating server behavior:
+    _open() { this._emit('open', {}); }
+    _sendFrame(obj) { this._emit('message', { data: JSON.stringify(obj) }); }
+  }
+  globalThis.WebSocket = FakeWebSocket;
   try {
     const sub = createMuxSubscriber({
       url: 'http://127.0.0.1:3080',
       log: () => {},
       onFrame: (f) => received.push(f.payload.type),
     });
-    // Poll until both frames are in (bounded) — no fixed-timing flake.
+    // Poll until the socket is constructed (bounded) — no fixed-timing flake.
     const deadline = Date.now() + 2000;
+    while (!FakeWebSocket.last && Date.now() < deadline) await sleep(5);
+    assert.ok(FakeWebSocket.last, 'subscriber should construct a WebSocket');
+    assert.ok(String(FakeWebSocket.last.url).startsWith('ws://'), 'http url must be converted to ws');
+    assert.ok(String(FakeWebSocket.last.url).endsWith('/api/events.mux'));
+    FakeWebSocket.last._open();
+    // The subscriber attaches its message listener only AFTER the open promise
+    // resolves (park phase), so yield to the event loop before sending frames.
+    // (With a real socket the server's replay frames arrive over the network,
+    // long after listeners are attached — no such race exists in production.)
+    await sleep(20);
+    // Real frame shape: rpcId at the ROOT, question details in payload.
+    FakeWebSocket.last._sendFrame({ type: 'server-request', rpcId: 'r1', method: 'question/requested', payload: { type: 'question/requested', sessionId: 'telegram-x', questions: [{ id: 'a', question: 'q', options: [{ label: 'L' }] }] } });
+    FakeWebSocket.last._sendFrame({ type: 'server-request', rpcId: 'r1', method: 'question/resolved', payload: { type: 'question/resolved', questionRpcId: 'r1', outcome: 'answered' } });
     while (received.length < 2 && Date.now() < deadline) await sleep(5);
     assert.deepEqual(received, ['question/requested', 'question/resolved']);
     sub.stop();
-    await sleep(1); // let the abort listener (microtask) mark aborted
-    assert.equal(aborted, true); // stop() must abort the controller
+    assert.equal(closedByStop, true); // stop() must close the socket
   } finally {
-    globalThis.fetch = realFetch;
+    globalThis.WebSocket = RealWebSocket;
   }
 });
 

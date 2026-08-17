@@ -162,7 +162,7 @@ export class TelegramClient {
     };
   }
 
-  async editMessageText(chatId, messageId, text, parseMode) {
+  async editMessageText(chatId, messageId, text, parseMode, replyMarkup) {
     try {
       const body = {
         chat_id: String(chatId),
@@ -170,6 +170,9 @@ export class TelegramClient {
         text,
       };
       if (parseMode) body.parse_mode = parseMode;
+      // Re-sending the keyboard forces clients to re-render it (a text-only
+      // edit can leave stale/missing keyboard rows on some clients).
+      if (replyMarkup) body.reply_markup = replyMarkup;
       await tgFetchOk(this.baseUrl, this.botToken, 'editMessageText', body);
       return true;
     } catch (err) {
