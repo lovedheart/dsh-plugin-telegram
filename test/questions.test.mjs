@@ -5,6 +5,8 @@ import {
   QUESTION_CALLBACK_PREFIX,
   parseQuestionCallback,
   buildQuestionCard,
+  buildQuestionCardFor,
+  buildSummaryCard,
   createQuestionModule,
   parseSseFrames,
   createMuxSubscriber,
@@ -103,6 +105,13 @@ await test('parses submit', () => {
 await test('parses cancel', () => {
   assert.deepEqual(parseQuestionCallback(`${QUESTION_CALLBACK_PREFIX}abc:cancel`), { key: 'abc', action: 'cancel' });
 });
+await test('parses lock q<qi>', () => {
+  assert.deepEqual(parseQuestionCallback(`${QUESTION_CALLBACK_PREFIX}abc:lock:q2`), { key: 'abc', action: 'lock', qi: 2 });
+});
+await test('returns null for bad lock index', () => {
+  assert.equal(parseQuestionCallback(`${QUESTION_CALLBACK_PREFIX}k:lock:x`), null);
+  assert.equal(parseQuestionCallback(`${QUESTION_CALLBACK_PREFIX}k:lock`), null);
+});
 await test('returns null for foreign prefix', () => {
   assert.equal(parseQuestionCallback(`tgapv2:abc:approve`), null);
 });
@@ -150,16 +159,51 @@ await test('HTML chars in question are escaped via injected escape', () => {
   assert.ok(text.includes('a&lt;b &amp; c&gt;?'));
 });
 
-await test('multi-question card labels Q1/Q2 and shows a submit button', () => {
+await test('multi-question flow: each question card pairs its question with its own options', () => {
   const qs = [
     { id: 'a', question: '第一个？', options: [{ label: 'A1' }] },
     { id: 'b', question: '第二个？', options: [{ label: 'B1' }] },
   ];
-  const { text, keyboard } = buildQuestionCard(qs, esc);
-  assert.ok(text.includes('Q1：第一个？'));
-  assert.ok(text.includes('Q2：第二个？'));
-  assert.ok(keyboard.flat().some((b) => b.callback_data.endsWith(':submit')));
-  assert.ok(!text.includes('也可以直接回复')); // multi → buttons only
+  const c0 = buildQuestionCardFor(qs[0], 0, 2, esc);
+  const c1 = buildQuestionCardFor(qs[1], 1, 2, esc);
+  assert.ok(c0.text.includes('❓ 需要你回答（1/2）'));
+  assert.ok(c0.text.includes('Q1：第一个？'));
+  assert.ok(c1.text.includes('❓ 需要你回答（2/2）'));
+  assert.ok(c1.text.includes('Q2：第二个？'));
+  // Each card carries ONLY its own options + a per-question lock button.
+  assert.ok(c0.keyboard.flat().some((b) => b.callback_data.endsWith(':q0:0')));
+  assert.ok(!c0.keyboard.flat().some((b) => b.callback_data.endsWith(':q1:')));
+  assert.ok(c0.keyboard.flat().some((b) => b.callback_data.endsWith(':lock:q0') && b.text === '✅ 提交本题'));
+  assert.ok(c1.keyboard.flat().some((b) => b.callback_data.endsWith(':lock:q1')));
+  // No global submit on per-question cards — that lives on the summary card.
+  assert.ok(!c0.keyboard.flat().some((b) => b.callback_data.endsWith(':submit')));
+});
+
+await test('summary card shows progress and the final submit button', () => {
+  const entry = {
+    questions: [
+      { id: 'a', header: '第1题', question: '一？' },
+      { id: 'b', question: '二？' },
+    ],
+    locked: new Set(['a']),
+  };
+  const { text, keyboard } = buildSummaryCard(entry, esc);
+  assert.ok(text.includes('📝 答题进度：1/2'));
+  assert.ok(text.includes('✅ 第1题'));
+  assert.ok(text.includes('⬜ 第2题'));
+  assert.ok(keyboard.flat().some((b) => b.callback_data.endsWith(':submit') && b.text === '🏁 提交全部'));
+});
+
+await test('locked per-card disables option buttons and marks the lock button', () => {
+  const q = { id: 'a', question: '一？', options: [{ label: 'A1' }, { label: 'A2' }] };
+  const sel = new Map([['a', ['A1']]]);
+  const { text, keyboard } = buildQuestionCardFor(q, 0, 2, esc, sel, new Set(['a']));
+  assert.ok(text.includes('🔒 已提交：A1'));
+  const optRows = keyboard.filter((row) => row.some((b) => b.callback_data.includes(':q0:')));
+  assert.ok(optRows.length > 0);
+  assert.ok(optRows.every((row) => row.every((b) => b.is_disabled === true)));
+  const lockBtn = keyboard.flat().find((b) => b.callback_data.endsWith(':lock:q0'));
+  assert.equal(lockBtn.is_disabled, true);
 });
 
 await test('multiSelect question marks selection and requires submit', () => {
@@ -374,41 +418,125 @@ await test('single question with missing multiSelect flag + "（多选）" text 
   const lastEdit = client.calls.edits[client.calls.edits.length - 1];
   assert.ok(lastEdit.text.includes('已选'), 'selection reflected');
   assert.ok(lastEdit.replyMarkup?.inline_keyboard?.some((row) => row.some((b) => b.text === '✅ 提交')), 'submit button still present');
-  // Tap B, then submit → both labels returned.
+  // Tap B, then submit → both labels returned. The model omitted multi_select,
+  // so the harness would reject >1 selected; the plugin carries them as custom.
   await mod.handleCallbackQuery({ id: 'inf2', data: btn(kb, ':q0:1').callback_data });
   await mod.handleCallbackQuery({ id: 'inf3', data: btn(kb, ':submit').callback_data });
   await sleep(1);
   assert.equal(state.responses.length, 1);
-  assert.deepEqual(state.responses[0].result.value.answer.answers[0].selected.sort(), ['A', 'B']);
+  const infA = state.responses[0].result.value.answer.answers[0];
+  assert.deepEqual(infA.selected, []);
+  assert.equal(infA.custom, 'A、B');
 });
 
-// Regression: a single-select tap on a MULTI-question card must NOT submit the
-// whole card (the old bug: it answered only Q1 and silently skipped Q2). It
-// should record the choice + re-edit the card, and only submit via 提交.
-console.log('\ncreateQuestionModule: multi-question single-select (regression)');
-await test('multi-question card: single-select tap records, does NOT submit', async () => {
+// Regression: a single-select tap on a per-question card must NOT submit the
+// whole flow (the old bug: it answered only Q1 and silently skipped Q2). It
+// records the choice + re-edits that card; locking confirms one question; only
+// 🏁 提交全部 on the summary card submits.
+console.log('\ncreateQuestionModule: multi-question per-card flow');
+await test('multi-question flow: tap records, lock confirms, 提交全部 submits all', async () => {
   const { mod, client, state } = makeModule();
   const q1 = { id: 'lang', question: '选哪种语言？', options: [{ label: '中文' }, { label: 'English' }] };
   const q2 = { id: 'topic', question: '选哪些主题？', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }] };
-  const kb = await request(mod, client, 'rpc-mq', 'telegram-abc', [q1, q2]);
-  // Tap Q1 "English" (q0:1) — single-select on a multi-question card.
+  mod.handleFrame({ rpcId: 'rpc-mq', payload: { type: 'question/requested', sessionId: 'telegram-abc', questions: [q1, q2] } });
+  await sleep(5);
+  // 2 question cards + 1 summary card.
+  assert.equal(client.calls.sends.length, 3);
+  const kb0 = client.calls.sends[0].replyMarkup.inline_keyboard;
+  const kb1 = client.calls.sends[1].replyMarkup.inline_keyboard;
+  const kbS = client.calls.sends[2].replyMarkup.inline_keyboard;
+  // Tap Q1 "English" — records only, no submit.
   const editsBefore = client.calls.edits.length;
-  await mod.handleCallbackQuery({ id: 'mq1', data: btn(kb, ':q0:1').callback_data });
+  await mod.handleCallbackQuery({ id: 'mq1', data: btn(kb0, ':q0:1').callback_data });
   await sleep(1);
-  // BUG FIX: must NOT have submitted the whole card.
-  assert.equal(state.responses.length, 0, 'single-select tap on a multi-question card must not submit');
-  // It re-edited the card to show the selection.
-  assert.ok(client.calls.edits.length > editsBefore, 'card was re-edited to reflect the choice');
-  // Now answer Q2 (multi) and submit.
-  await mod.handleCallbackQuery({ id: 'mq2', data: btn(kb, ':q1:0').callback_data });
-  await mod.handleCallbackQuery({ id: 'mq3', data: btn(kb, ':submit').callback_data });
+  assert.equal(state.responses.length, 0, 'single-select tap must not submit');
+  assert.ok(client.calls.edits.length > editsBefore, 'question card re-edited to reflect the choice');
+  // Lock Q1 → its card shows 🔒 + disabled options; summary progress 1/2.
+  await mod.handleCallbackQuery({ id: 'mq2', data: btn(kb0, ':lock:q0').callback_data });
+  await sleep(1);
+  const lockEdits = client.calls.edits.slice(-2);
+  assert.ok(lockEdits.some((e) => e.text.includes('🔒 已提交：English')), 'locked card shows the choice');
+  assert.ok(lockEdits.some((e) => e.text.includes('答题进度：1/2')), 'summary progress updated');
+  // Answer Q2 (multi) and lock it. Locks alone must not submit.
+  await mod.handleCallbackQuery({ id: 'mq3', data: btn(kb1, ':q1:0').callback_data });
+  await mod.handleCallbackQuery({ id: 'mq4', data: btn(kb1, ':lock:q1').callback_data });
+  await sleep(1);
+  assert.equal(state.responses.length, 0, 'locks alone must not submit');
+  // Final submit from the summary card.
+  await mod.handleCallbackQuery({ id: 'mq5', data: btn(kbS, ':submit').callback_data });
   await sleep(1);
   assert.equal(state.responses.length, 1);
   const answers = state.responses[0].result.value.answer.answers;
-  const lang = answers.find((x) => x.id === 'lang');
-  const topic = answers.find((x) => x.id === 'topic');
-  assert.deepEqual(lang.selected, ['English']);
-  assert.deepEqual(topic.selected, ['A']);
+  assert.deepEqual(answers.find((x) => x.id === 'lang').selected, ['English']);
+  assert.deepEqual(answers.find((x) => x.id === 'topic').selected, ['A']);
+});
+
+await test('option tap on a locked question is ignored (no re-edit, no submit)', async () => {
+  const { mod, client, state } = makeModule();
+  const q1 = { id: 'a', question: '一？', options: [{ label: 'A1' }, { label: 'A2' }] };
+  const q2 = { id: 'b', question: '二？', options: [{ label: 'B1' }] };
+  mod.handleFrame({ rpcId: 'rpc-lk', payload: { type: 'question/requested', sessionId: 'telegram-abc', questions: [q1, q2] } });
+  await sleep(5);
+  const kb0 = client.calls.sends[0].replyMarkup.inline_keyboard;
+  await mod.handleCallbackQuery({ id: 'lk1', data: btn(kb0, ':lock:q0').callback_data });
+  await sleep(1);
+  const editsBefore = client.calls.edits.length;
+  await mod.handleCallbackQuery({ id: 'lk2', data: btn(kb0, ':q0:1').callback_data });
+  await sleep(1);
+  assert.equal(client.calls.edits.length, editsBefore, 'no re-edit after locking');
+  assert.equal(state.responses.length, 0);
+  assert.ok(client.calls.acks.some((a) => String(a.text).includes('已提交')));
+});
+
+// Regression (the real-world bug): model wrote "（多选）" questions but OMITTED
+// multi_select:true. The harness validates strictly against the raw args and
+// rejects >1 selected ('bad-response'), leaving the agent turn blocked forever.
+// The plugin must convert such picks to a custom string so the answer lands.
+console.log('\ncreateQuestionModule: harness validation mismatch (regression)');
+await test('inferred multi-select without multi_select flag converts >1 picks to custom', async () => {
+  const { mod, client, state } = makeModule();
+  const q = { id: 'quiz', header: '第1题（多选）', question: '下列哪些动物属于哺乳动物？（多选）', options: [{ label: '蝙蝠' }, { label: '企鹅' }, { label: '海豚' }, { label: '鲨鱼' }] };
+  mod.handleFrame({ rpcId: 'rpc-mm', payload: { type: 'question/requested', sessionId: 'telegram-abc', questions: [q] } });
+  await sleep(5);
+  const kb = client.calls.sends[0].replyMarkup.inline_keyboard;
+  await mod.handleCallbackQuery({ id: 'mm1', data: btn(kb, ':q0:0').callback_data }); // 蝙蝠
+  await mod.handleCallbackQuery({ id: 'mm2', data: btn(kb, ':q0:2').callback_data }); // 海豚
+  await mod.handleCallbackQuery({ id: 'mm3', data: btn(kb, ':submit').callback_data });
+  await sleep(1);
+  assert.equal(state.responses.length, 1);
+  const a = state.responses[0].result.value.answer.answers[0];
+  assert.deepEqual(a.selected, []);
+  assert.equal(a.custom, '蝙蝠、海豚');
+});
+
+await test('explicit multi_select:true keeps selected labels (no conversion)', async () => {
+  const { mod, client, state } = makeModule();
+  const q = { id: 'm', question: '多选？', multiSelect: true, options: [{ label: 'X' }, { label: 'Y' }] };
+  const kb = await request(mod, client, 'rpc-exp', 'telegram-abc', [q]);
+  await mod.handleCallbackQuery({ id: 'ex1', data: btn(kb, ':q0:0').callback_data });
+  await mod.handleCallbackQuery({ id: 'ex2', data: btn(kb, ':q0:1').callback_data });
+  await mod.handleCallbackQuery({ id: 'ex3', data: btn(kb, ':submit').callback_data });
+  await sleep(1);
+  const a = state.responses[0].result.value.answer.answers[0];
+  assert.deepEqual(a.selected.sort(), ['X', 'Y']);
+  assert.equal(a.custom, undefined);
+});
+
+await test('rejected respond (bad-response) settles with a warning, not the web-answer label', async () => {
+  const client = makeClient();
+  const state = { responses: [] };
+  const mod = createQuestionModule({
+    log: () => {},
+    escape: esc,
+    client,
+    ownership: () => ({ chatId: '123', threadId: null }),
+    respond: async () => ({ accepted: false, reason: 'bad-response' }),
+  });
+  const kb = await request(mod, client, 'rpc-rej', 'telegram-abc', [singleQ]);
+  await mod.handleCallbackQuery({ id: 'rej1', data: btn(kb, ':cancel').callback_data });
+  await sleep(1);
+  assert.ok(client.calls.edits.some((e) => e.text.includes('⚠️ 提交被拒绝')));
+  assert.ok(!client.calls.edits.some((e) => e.text.includes('🌐')));
 });
 
 console.log('\ncreateQuestionModule: ownership + replay + web-first');
