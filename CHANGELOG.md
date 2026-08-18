@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.6] - 2026-06-29
+
+### Changed
+- **`telegram_send_voice` now scopes itself to Telegram.** The tool
+  description and the per-message injected instruction make clear it is for
+  when the user is on TELEGRAM and asks to hear a reply / 语音播报 — and that
+  for the Web GUI the agent should use `text_to_speech` instead so the Web can
+  render an inline audio card. No behavior change on Telegram; this stops the
+  model reaching for the Telegram voice tool when the reply is destined for the
+  browser.
+
 ## [0.4.5] - 2026-06-29
 
 ### Added

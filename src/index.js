@@ -1665,8 +1665,11 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     name: 'telegram_send_voice',
     description:
       'Send a voice message to a Telegram chat. The text is synthesized to speech ' +
-      'via the local Qwen3-TTS service and sent as an OGG Opus voice note. ' +
-      'Use this when the user wants to hear a reply instead of reading it.',
+      'via the local Qwen3-TTS service and sent as an OGG Opus voice note. '
+      + 'Use this when the user is chatting on TELEGRAM (their message carries a '
+      + '"This message comes from Telegram" note) and asks to hear a reply / 语音播报: '
+      + 'it delivers the voice straight to the user there. Do NOT use it for the Web GUI: '
+      + 'there, use text_to_speech instead so the Web can render an inline audio card.',
 
     parameters: {
       chat_id: {
@@ -2398,11 +2401,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
             // DSH's MessageSource requires kind ∈ {user, plugin, model, tool}.
             // Use 'plugin' (this plugin is the source of the message) and
             // keep the chat id in the text so the agent can route replies.
+            const voiceInstruction = ` If the user asks for a spoken / audio reply (语音播报 / 语音 / 朗读 / read aloud), use the telegram_send_voice tool with chat_id: ${message.chatId} — do NOT use text_to_speech, whose output would not reach Telegram.`;
             const fileInstruction = ` To send the user a file you have locally (a PDF, image, video, audio, or any document), pass its ABSOLUTE local path directly to telegram_send_document / telegram_send_photo / telegram_send_video / telegram_send_audio — the plugin uploads it to Telegram via multipart; do NOT upload it to a public host first.`;
             const replyInstruction =
               agentResponseMode === 'direct'
-                ? `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Produce your answer as normal assistant text; the plugin will forward it back to Telegram automatically. Do NOT call telegram_send_message.` + fileInstruction
-                : `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Reply to it using the telegram_send_message tool with chat_id: ${message.chatId}.` + fileInstruction;
+                ? `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Produce your answer as normal assistant text; the plugin will forward it back to Telegram automatically. Do NOT call telegram_send_message.` + voiceInstruction + fileInstruction
+                : `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Reply to it using the telegram_send_message tool with chat_id: ${message.chatId}.` + voiceInstruction + fileInstruction;
 
             const bodyParts = [];
             if (message.text) {
