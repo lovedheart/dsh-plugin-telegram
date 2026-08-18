@@ -422,8 +422,14 @@ export class ProgressIndicator {
     // (so the user watches the answer appear), and stop() finalizes it with an
     // HTML render (or a chunked send when it exceeds the 4096 hard limit).
     this.streaming = o.streaming === true;
-    this.replyText = '';       // accumulated from text-delta (live preview)
+    this.replyText = '';       // accumulated from text-delta (lossy preview)
     this.finalReplyText = '';  // authoritative full text from assistant/message
+    // Most recent NON-reply activity, for the live footer: when the model is
+    // NOT actively emitting text (mid tool-call / thinking), the message text
+    // would otherwise be unchanged between edits and the "轨迹" appears frozen.
+    // A footer showing the latest step keeps it visibly moving.
+    this.lastActivityKind = null;   // 'text' | 'reasoning' | 'tool'
+    this.lastActivityName = '';
     this.finalized = false;
     // Set true right before stop() when the stop was triggered by a turn/end
     // event (vs. preemption by a newer turn or the timeout cap). Decides whether
@@ -435,6 +441,8 @@ export class ProgressIndicator {
   _addTool(name, args, id) {
     if (id && this.seenToolIds.has(id)) return;
     if (id) this.seenToolIds.add(id);
+    this.lastActivityKind = 'tool';
+    this.lastActivityName = String(name || 'tool');
     this.trace.push({ kind: 'tool', name: String(name || 'tool'), args: args ?? '' });
     this._capTrace();
   }
@@ -443,6 +451,7 @@ export class ProgressIndicator {
   _addReasoning(text) {
     const t = String(text ?? '');
     if (!t) return;
+    this.lastActivityKind = 'reasoning';
     const last = this.trace[this.trace.length - 1];
     if (last && last.kind === 'reasoning') last.text += t;
     else this.trace.push({ kind: 'reasoning', text: t });
@@ -467,16 +476,28 @@ export class ProgressIndicator {
   buildTraceText() {
     const per = this.o.perBlockChars ?? 240;
     const max = this.o.maxChars ?? 1500;
-    // Streaming reply (方案B): once the final reply starts streaming, it
-    // dominates the message — show its TAIL (newest text, like live typing),
+    // Streaming reply (方案B): once the reply starts arriving, it dominates
+    // the message — show its TAIL (newest text, like live typing),
     // tail-truncated to `maxChars`. Plain text so partial markdown never
     // breaks parsing; the final HTML render happens at stop().
-    if (this.streaming && this.replyText) {
-      const reply = compactText(this.replyText);
-      const header = '💬 回复（生成中）\n';
-      return reply.length > max
-        ? header + '…' + reply.slice(-(max))
-        : header + reply;
+    //
+    // A latest-activity footer (🔧 tool / 💭 reasoning) is appended so the
+    // message keeps CHANGING while the model is mid tool-call or thinking —
+    // during those stretches no text-delta fires, so without the footer the
+    // reply tail is static, push() sees text===lastText and skips the edit,
+    // and the trail appears frozen on long replies. The footer makes the text
+    // differ on each new step so the edit re-fires (still capped by the
+    // intervalMs throttle, so no extra API load).
+    if (this.streaming) {
+      const live = this.replyText;
+      if (live) {
+        const reply = compactText(live);
+        const header = '💬 回复（生成中）\n';
+        const foot = this._latestActivityLine(max);
+        const bodyMax = Math.max(10, max - header.length - foot.length);
+        const body = reply.length > bodyMax ? '…' + reply.slice(-(bodyMax - 1)) : reply;
+        return header + body + foot;
+      }
     }
     const parts = [];
     for (const b of this.trace) {
@@ -496,6 +517,26 @@ export class ProgressIndicator {
       body = '…' + body.slice(-(budget - 1));
     }
     return header + body;
+  }
+
+  /**
+   * One-line "what's happening right now" footer for the streaming branch.
+   * Returns '' when the model is actively emitting reply text (the live tail
+   * is already changing, so a footer would just add noise); otherwise shows
+   * the latest tool call or a "thinking" marker so the message text differs
+   * on each new step and the edit re-fires instead of freezing.
+   */
+  _latestActivityLine() {
+    if (this.lastActivityKind === 'text' || this.lastActivityKind === null) return '';
+    let line;
+    if (this.lastActivityKind === 'tool') {
+      line = '🔧 ' + (this.lastActivityName || 'tool');
+    } else {
+      line = '💭 思考中…';
+    }
+    // Keep the footer to a single short line so it never balloons the message.
+    if (line.length > 60) line = line.slice(0, 59) + '…';
+    return '\n' + line + ' …';
   }
 
   /** Post the indicator message (once); returns its id or null. */
@@ -587,6 +628,9 @@ export class ProgressIndicator {
         // re-read from the final assistant/message event at finalize time, so
         // a missed delta is harmless.)
         this.replyText += String(chunk.text ?? '');
+        // Mark "actively emitting text" so the activity footer stays hidden —
+        // the live reply tail is already changing, a footer would be noise.
+        this.lastActivityKind = 'text';
       } else if (chunk.type === 'block-end' && chunk.block) {
         const blk = chunk.block;
         if (blk.type === 'reasoning') this._addReasoning(blk.text);
@@ -1589,7 +1633,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       audio: {
         type: 'string',
         required: true,
-        description: 'Telegram file_id or public URL of the audio file.',
+        description: 'Telegram file_id, public URL, or absolute local file path of the audio file.',
       },
       caption: {
         type: 'string',

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.7] - 2026-06-29
+
+### Fixed
+- **Live trajectory no longer freezes on long replies / tool calls.** When the
+  model is mid tool-call or thinking, no `text-delta` fires, so the streaming
+  reply tail was static and the in-place message edit stopped re-firing — the
+  "轨迹" looked frozen. `ProgressIndicator` now tracks the latest non-reply
+  activity and appends a one-line footer (🔧 tool / 💭 思考中…) to the
+  streaming branch, so the text differs on each new step and the edit
+  re-fires (still throttled by `intervalMs`, no extra API load). The footer
+  hides while reply text is actively streaming.
+
 ## [0.4.6] - 2026-06-29
 
 ### Changed
