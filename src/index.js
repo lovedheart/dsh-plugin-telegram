@@ -2254,25 +2254,28 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
           case '/compact': {
             if (!active) { await reply('（没有可压缩的会话）'); return true; }
-            // In web mode the host-plane compaction row is disabled and the
-            // service lives in the per-session (agent) scope, so look on the
-            // agent's scoped context first, then fall back to the host plane.
-            const compaction = active.ctx?.get?.('compaction') ?? ctx.get?.('compaction');
+            // In web mode the preset mounts compaction inside an `isolate` realm.
+            // Per dsh-agent-presets such a realm is invisible to everything
+            // outside the group — including the host AND the agent's own scoped
+            // context — so `active.ctx?.compaction` is always undefined here.
+            // The correct read-addressing API is agentPresets.serviceFor(agent,
+            // name), which a caller holding the agent uses to read one of its
+            // preset-mounted services (the same trick dsh-host-apiproxy uses for
+            // goals/skills). Fall back to the direct property for deployments
+            // that don't isolate it (e.g. CLI host plane).
+            let compaction;
+            try {
+              compaction = ctx.get?.('agentPresets')?.serviceFor?.(active, 'compaction')
+                ?? active.ctx?.compaction;
+            } catch { /* not available */ }
             if (!compaction?.compactNow) {
-              await reply('❌ compaction 服务不可用（该部署未挂载 @deepseek-ai/dsh-compaction-basic）。');
+              await reply('❌ compaction 服务不可用（该 agent 的 preset 未挂载 compaction，如 minimal preset）。');
               return true;
             }
             const ac = new AbortController();
             const timer = setTimeout(() => ac.abort(), 120_000);
             try {
-              const result = await compaction.compactNow(
-                {
-                  session: active.session,
-                  options: active.options,
-                  runMaintenance: (task) => active.runMaintenance(task),
-                },
-                ac.signal,
-              );
+              const result = await compaction.compactNow(active, ac.signal);
               if (result === null) {
                 await reply('（没有可压缩的历史。）');
               } else {

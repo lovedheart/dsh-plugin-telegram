@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.8] - 2026-08-18
+
+### Fixed
+- **`/compact` now finds the compaction service in web mode.** When the preset
+  mounts compaction inside an `isolate` realm, the service is invisible to the
+  host plane and to the agent's own scoped context, so `active.ctx?.compaction`
+  was always `undefined` and the command reported the service as unavailable.
+  The lookup now goes through `agentPresets.serviceFor(agent, 'compaction')`
+  (falling back to the direct property for non-isolated deployments), and
+  `compactNow` is called with the agent directly.
+
 ## [0.4.7] - 2026-06-29
 
 ### Fixed
