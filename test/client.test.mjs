@@ -46,6 +46,21 @@ test('undici fetch failed + nested ECONNRESET cause -> transient', () => {
 test('top-level ECONNREFUSED -> transient', () => {
   assert.equal(isTransientTelegramError(netError('ECONNREFUSED')), true);
 });
+test('client-side timeout (AbortError w/ TimeoutError cause) -> transient', () => {
+  const cause = new Error('TimeoutError');
+  cause.name = 'TimeoutError';
+  const abort = new Error('The operation was aborted');
+  abort.name = 'AbortError';
+  abort.cause = cause;
+  // A timed-out sendMessage must be RETRIED (not dropped) — the whole point of
+  // the requestTimeoutMs guard is to turn a hang into a retryable error.
+  assert.equal(isTransientTelegramError(abort), true);
+});
+test('external AbortSignal abort (bare AbortError) -> transient', () => {
+  const abort = new Error('The operation was aborted');
+  abort.name = 'AbortError';
+  assert.equal(isTransientTelegramError(abort), true);
+});
 test('400 bad entities -> PERMANENT', () => {
   assert.equal(isTransientTelegramError(new TelegramApiError('can\'t parse entities', '', 400, 400)), false);
 });
@@ -197,6 +212,83 @@ await atest('downloads bytes to <uuid><ext> and returns { localPath, fileName, f
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-request timeout (regression: a hung Telegram call must NOT block forever,
+// which used to deafen the whole poller). We model a hang with a fetch that
+// only settles when its abort signal fires, then assert the call aborts within
+// the configured requestTimeoutMs.
+// ---------------------------------------------------------------------------
+console.log('\nTelegramClient.requestTimeoutMs (hang protection):');
+await atest('a hung fetch is aborted within requestTimeoutMs', async () => {
+  globalThis.fetch = async (url, init) => {
+    // Simulate a network hang: never resolves until the signal aborts.
+    const signal = init?.signal;
+    if (!signal) return new Promise(() => {});
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) return reject(new Error('aborted'));
+      signal.addEventListener('abort', () => {
+        const e = new Error(`The operation was aborted (aborted ${signal.reason?.name === 'TimeoutError' ? 'by timeout' : ''})`);
+        e.name = 'AbortError';
+        e.cause = signal.reason;
+        reject(e);
+      }, { once: true });
+    });
+  };
+  // In production the loop stays alive via the WebSocket + poll loop, so
+  // AbortSignal.timeout's timer fires. In this isolated test nothing else is
+  // pending, so a ref'd keep-alive interval keeps the event loop open until the
+  // 120ms timeout fires (mirrors that production activity).
+  const keepAlive = setInterval(() => {}, 25);
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE, requestTimeoutMs: 120 });
+  const t0 = Date.now();
+  let threw = false;
+  try {
+    await c.sendMessage({ chatId: 1, text: 'hi' });
+  } catch { threw = true; } finally {
+    clearInterval(keepAlive);
+  }
+  const elapsed = Date.now() - t0;
+  globalThis.fetch = realFetch;
+  assert.equal(threw, true, 'hung call should have been aborted (thrown)');
+  assert.ok(elapsed < 1000, `should abort within ~120ms, took ${elapsed}ms`);
+});
+await atest('a healthy fast response is NOT aborted by the timeout', async () => {
+  const f = makeFakeFetch();
+  f.enqueue({ ok: true, result: { message_id: 42, chat: { id: 1 } } });
+  globalThis.fetch = f.fn;
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE, requestTimeoutMs: 1000 });
+  const res = await c.sendMessage({ chatId: 1, text: 'hi' });
+  globalThis.fetch = realFetch;
+  assert.equal(res.messageId, 42);
+});
+
+// ---------------------------------------------------------------------------
+// sendChatAction throwOnFailure (regression: the progress-indicator typing
+// fallback needs a real reject to detect a broken feedback channel; the client
+// swallows errors by default, so a plain call would never trigger the fallback).
+// ---------------------------------------------------------------------------
+console.log('\nTelegramClient.sendChatAction (throwOnFailure):');
+await atest('swallows errors by default (best-effort)', async () => {
+  const f = makeFakeFetch();
+  f.enqueue({ ok: false, error_code: 500, description: 'server hiccup' }, { status: 500 });
+  globalThis.fetch = f.fn;
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE });
+  let threw = false;
+  try { await c.sendChatAction(1, 'typing'); } catch { threw = true; }
+  globalThis.fetch = realFetch;
+  assert.equal(threw, false, 'default call must stay best-effort (no throw)');
+});
+await atest('rethrows when throwOnFailure is set', async () => {
+  const f = makeFakeFetch();
+  f.enqueue({ ok: false, error_code: 500, description: 'server hiccup' }, { status: 500 });
+  globalThis.fetch = f.fn;
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE });
+  let threw = false;
+  try { await c.sendChatAction(1, 'typing', undefined, { throwOnFailure: true }); } catch { threw = true; }
+  globalThis.fetch = realFetch;
+  assert.equal(threw, true, 'throwOnFailure must surface the error so callers can detect the break');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

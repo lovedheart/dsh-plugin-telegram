@@ -13,6 +13,22 @@ import { randomUUID } from 'node:crypto';
 
 const DEFAULT_BASE_URL = 'https://api.telegram.org';
 const DEFAULT_LONG_POLL_TIMEOUT = 30;
+// Client-side cap on a single HTTP request (ms). The Telegram link is flaky
+// (~45% request timeouts measured); without a cap a request that *hangs*
+// (never resolves, never errors) blocks the caller forever — and because the
+// poll loop awaits its handlers, one hung call deafens the whole bot. A
+// bounded timeout converts that into a retryable transport error.
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 300_000; // file downloads can be large/slow
+
+// Combine an optional external signal with a per-request timeout signal so a
+// hung fetch always aborts within `timeoutMs`. Returns undefined when there is
+// nothing to combine (no external signal, no timeout).
+function withTimeout(signal, timeoutMs) {
+  const timeout = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
+  if (timeout && signal) return AbortSignal.any([signal, timeout]);
+  return timeout || signal || undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Error classes
@@ -47,7 +63,12 @@ export class TelegramRateLimitError extends TelegramApiError {
  * - transient transport failures (undici wraps them as `TypeError:
  *   fetch failed` with the real error in `err.cause`, sometimes nested),
  * - 429 rate limits, 409 conflicts (another getUpdates consumer),
- * - 5xx API responses (server-side hiccup).
+ * - 5xx API responses (server-side hiccup),
+ * - client-side aborts/timeouts (our per-request AbortSignal.timeout fires as
+ *   an `AbortError` whose cause is a `TimeoutError`; an external AbortSignal
+ *   abort surfaces as a bare `AbortError`). A timeout means "too slow" → retry;
+ *   a shutdown-abort is harmless here because callers already stop on
+ *   `signal.aborted` / `running === false` before any retry loop runs.
  * Permanent errors (400 bad entities, 403 banned, ...) return false and
  * must propagate to the caller.
  */
@@ -61,6 +82,10 @@ export function isTransientTelegramError(err) {
   }
   const chain = [err, err?.cause, err?.cause?.cause].filter(Boolean);
   return chain.some((e) =>
+    // Client-side timeout / abort (our requestTimeoutMs guard or an external
+    // AbortSignal). name-based check because undici/node use 'AbortError' and
+    // 'TimeoutError' as constructor names.
+    e?.name === 'AbortError' || e?.name === 'TimeoutError' ||
     (e.constructor?.name === 'TypeError' && String(e.message || '').includes('fetch failed')) ||
     ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET'].includes(e.code),
   );
@@ -70,13 +95,13 @@ export function isTransientTelegramError(err) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-async function tgFetch(baseUrl, botToken, method, body, signal) {
+async function tgFetch(baseUrl, botToken, method, body, signal, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
   const url = `${baseUrl}/bot${botToken}/${method}`;
   const resp = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body ?? {}),
-    signal,
+    signal: withTimeout(signal, timeoutMs),
   });
 
   if (!resp.ok) {
@@ -99,8 +124,8 @@ async function tgFetch(baseUrl, botToken, method, body, signal) {
   return resp.json();
 }
 
-async function tgFetchOk(baseUrl, botToken, method, body, signal) {
-  const data = await tgFetch(baseUrl, botToken, method, body, signal);
+async function tgFetchOk(baseUrl, botToken, method, body, signal, timeoutMs) {
+  const data = await tgFetch(baseUrl, botToken, method, body, signal, timeoutMs);
   if (typeof data !== 'object' || data === null) {
     throw new Error(`Unexpected response from Telegram API ${method}`);
   }
@@ -116,6 +141,7 @@ export class TelegramClient {
     this.botToken = config.botToken;
     this.baseUrl = (config.baseUrl?.trim().replace(/\/+$/, '') || DEFAULT_BASE_URL);
     this._me = null;
+    this.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     if (!this.botToken) {
       throw new Error('Telegram bot token is required');
@@ -124,9 +150,16 @@ export class TelegramClient {
 
   // ---- Identity -----------------------------------------------------------
 
+  // Thin wrapper over tgFetchOk that applies the client's per-request timeout
+  // so a hung Telegram call always aborts instead of blocking the caller (and,
+  // with the poller's fire-and-forget dispatch, instead of deafening the bot).
+  async _api(method, body, signal, timeoutMs = this.requestTimeoutMs) {
+    return tgFetchOk(this.baseUrl, this.botToken, method, body, signal, timeoutMs);
+  }
+
   async getMe() {
     if (this._me) return this._me;
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'getMe');
+    const resp = await this._api('getMe');
     const result = resp.result;
     if (!result) throw new Error('getMe returned no result');
     this._me = {
@@ -153,7 +186,7 @@ export class TelegramClient {
     // we forward it verbatim.
     if (opts.replyMarkup) body.reply_markup = opts.replyMarkup;
 
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'sendMessage', body);
+    const resp = await this._api('sendMessage', body);
     const msg = resp.result;
     if (!msg) throw new Error('sendMessage returned no result');
     return {
@@ -173,7 +206,7 @@ export class TelegramClient {
       // Re-sending the keyboard forces clients to re-render it (a text-only
       // edit can leave stale/missing keyboard rows on some clients).
       if (replyMarkup) body.reply_markup = replyMarkup;
-      await tgFetchOk(this.baseUrl, this.botToken, 'editMessageText', body);
+      await this._api('editMessageText', body);
       return true;
     } catch (err) {
       if (err.message?.includes('Message is not modified')) return true;
@@ -191,7 +224,7 @@ export class TelegramClient {
       body.caption = opts.caption;
       if (opts.parseMode) body.parse_mode = opts.parseMode;
     }
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'sendPhoto', body);
+    const resp = await this._api('sendPhoto', body);
     const msg = resp.result;
     if (!msg) throw new Error('sendPhoto returned no result');
     return {
@@ -210,7 +243,7 @@ export class TelegramClient {
       body.caption = opts.caption;
       if (opts.parseMode) body.parse_mode = opts.parseMode;
     }
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'sendDocument', body);
+    const resp = await this._api('sendDocument', body);
     const msg = resp.result;
     if (!msg) throw new Error('sendDocument returned no result');
     return {
@@ -229,7 +262,7 @@ export class TelegramClient {
       body.caption = opts.caption;
       if (opts.parseMode) body.parse_mode = opts.parseMode;
     }
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'sendVideo', body);
+    const resp = await this._api('sendVideo', body);
     const msg = resp.result;
     if (!msg) throw new Error('sendVideo returned no result');
     return {
@@ -253,7 +286,7 @@ export class TelegramClient {
     if (opts.duration != null && Number.isFinite(Number(opts.duration))) {
       body.duration = String(Math.round(Number(opts.duration)));
     }
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'sendAudio', body);
+    const resp = await this._api('sendAudio', body);
     const msg = resp.result;
     if (!msg) throw new Error('sendAudio returned no result');
     return {
@@ -289,7 +322,7 @@ export class TelegramClient {
     const resp = await fetch(url, {
       method: 'POST',
       body: form,
-      signal: opts.signal,
+      signal: withTimeout(opts.signal, DEFAULT_REQUEST_TIMEOUT_MS),
     });
 
     if (!resp.ok) {
@@ -315,7 +348,7 @@ export class TelegramClient {
   }
 
   async answerCallbackQuery(queryId, text, showAlert) {
-    await tgFetchOk(this.baseUrl, this.botToken, 'answerCallbackQuery', {
+    await this._api('answerCallbackQuery', {
       callback_query_id: queryId,
       text,
       show_alert: showAlert,
@@ -325,7 +358,7 @@ export class TelegramClient {
 
   async deleteMessage(chatId, messageId) {
     try {
-      await tgFetchOk(this.baseUrl, this.botToken, 'deleteMessage', {
+      await this._api('deleteMessage', {
         chat_id: String(chatId),
         message_id: messageId,
       });
@@ -347,7 +380,7 @@ export class TelegramClient {
    * @returns {{ filePath: string, fileSize: number|undefined, fileName?: string }}
    */
   async getFile(fileId) {
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'getFile', { file_id: fileId });
+    const resp = await this._api('getFile', { file_id: fileId });
     const f = resp.result;
     if (!f?.file_path) throw new Error(`getFile returned no file_path for ${fileId}`);
     return {
@@ -375,7 +408,7 @@ export class TelegramClient {
     mkdirSync(dirname(localPath), { recursive: true });
 
     const url = `${this.baseUrl}/file/bot${this.botToken}/${info.filePath}`;
-    const resp = await fetch(url, { signal: opts.signal });
+    const resp = await fetch(url, { signal: withTimeout(opts.signal, DEFAULT_DOWNLOAD_TIMEOUT_MS) });
     if (!resp.ok || !resp.body) {
       const errCode = resp.status;
       throw new TelegramApiError(`Telegram file download failed (${errCode})`, '', errCode);
@@ -398,7 +431,12 @@ export class TelegramClient {
     const body = { limit, timeout };
     if (offset !== undefined && offset !== null) body.offset = offset;
 
-    const resp = await tgFetchOk(this.baseUrl, this.botToken, 'getUpdates', body, signal);
+    // The long-poll legitimately HOLDS for `timeout` seconds on Telegram's side
+    // before returning an empty batch, so the client-side abort must exceed
+    // that or we'd cancel every healthy long-poll. Use the larger of the
+    // configured request timeout and (long-poll hold + 10s headroom).
+    const reqTimeoutMs = Math.max(this.requestTimeoutMs, (timeout * 1000) + 10_000);
+    const resp = await this._api('getUpdates', body, signal, reqTimeoutMs);
     const results = resp.result;
     if (!results || !Array.isArray(results)) return [];
 
@@ -416,7 +454,7 @@ export class TelegramClient {
    * menu. commands: [{command, description}] (command has no leading slash).
    */
   async setMyCommands(commands) {
-    await tgFetchOk(this.baseUrl, this.botToken, 'setMyCommands', {
+    await this._api('setMyCommands', {
       commands: commands.map((c) => ({ command: c.command, description: c.description })),
     });
     return true;
@@ -424,13 +462,17 @@ export class TelegramClient {
 
   // ---- Chat action --------------------------------------------------------
 
-  async sendChatAction(chatId, action, messageThreadId) {
+  async sendChatAction(chatId, action, messageThreadId, opts = {}) {
+    const body = { chat_id: String(chatId), action };
+    if (messageThreadId) body.message_thread_id = messageThreadId;
     try {
-      const body = { chat_id: String(chatId), action };
-      if (messageThreadId) body.message_thread_id = messageThreadId;
-      await tgFetchOk(this.baseUrl, this.botToken, 'sendChatAction', body);
-    } catch {
-      // Best-effort
+      await this._api('sendChatAction', body);
+    } catch (err) {
+      // Best-effort by default; the progress-indicator typing fallback passes
+      // throwOnFailure so a persistently broken feedback channel can be detected
+      // and surfaced (a silently-swallowed reject left the bot "working but
+      // showing nothing", which reads as unresponsive).
+      if (opts.throwOnFailure) throw err;
     }
   }
 

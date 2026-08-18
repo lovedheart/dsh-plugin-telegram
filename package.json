@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "prepare": "cp src/*.js lib/",
-    "test": "node test/text.test.mjs && node test/client.test.mjs && node test/progress.test.mjs && node test/approval.test.mjs && node test/questions.test.mjs"
+    "test": "node test/text.test.mjs && node test/client.test.mjs && node test/poller.test.mjs && node test/progress.test.mjs && node test/approval.test.mjs && node test/questions.test.mjs"
   },
   "license": "MIT",
   "peerDependencies": {

@@ -27,3 +27,7 @@
         agentResponseMode: 'tool'
         # Optional prefix for agent's responses
         replyPrefix: ''
+        # Verbose plugin logging — surfaces typing/progress feedback-channel status
+        # that would otherwise be silent (non-error logs are dropped when off).
+        # Keep on while diagnosing display issues; set false to quiet it down.
+        verbose: true
