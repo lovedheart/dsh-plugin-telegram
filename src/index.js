@@ -161,6 +161,19 @@ const defaults = {
   // Voice (TTS) — used by telegram_send_voice.
   ttsEndpoint: 'http://127.0.0.1:8890', // local Qwen3-TTS service
   ttsLang: 'Chinese',                   // default language label for synthesis
+  // Inbound voice (STT). When the user sends a Telegram voice note, transcribe
+  // it locally (Whisper, OpenAI-compatible) and:
+  //   (a) reply with the recognized text directly UNDER the voice bubble — a
+  //       reply to the voice message is the only way to show it "on the next
+  //       line" (Telegram bots cannot edit other people's messages);
+  //   (b) fold the SAME transcript into the note injected to the agent, so the
+  //       agent already has the text and does NOT need to call transcribe_audio.
+  // sttEndpoint matches the Whisper proxy dsh-tool-audio already uses.
+  // Requires forwardInboundMedia (the file must be downloaded to transcribe).
+  sttEndpoint: 'http://127.0.0.1:18068',
+  voiceTranscribe: true,           // master switch for inbound-voice transcription
+  voiceTranscribeLanguage: 'auto', // force an ISO-639-1 code, or 'auto' to detect
+  voiceTranscriptToAgent: true,    // also include the transcript in the agent note
   // Logging
   verbose: false,             // Enable debug and info logs (default: errors only)
 };
@@ -205,6 +218,10 @@ const schema = {
   webUrl: ['string'],
   ttsEndpoint: ['string'],
   ttsLang: ['string'],
+  sttEndpoint: ['string'],
+  voiceTranscribe: ['boolean'],
+  voiceTranscribeLanguage: ['string'],
+  voiceTranscriptToAgent: ['boolean'],
   verbose: ['boolean'],
 };
 export const Config = {
@@ -929,6 +946,91 @@ export async function apply(ctx, config) {
   // -----------------------------------------------------------------------
   const ttsEndpoint = (c.ttsEndpoint || 'http://127.0.0.1:8890').replace(/\/+$/, '');
 
+  // Inbound voice (STT) config. sttEndpoint defaults to the Whisper proxy that
+  // dsh-tool-audio's transcribe_audio already uses. Transcription only runs
+  // when the file can be downloaded, so it is gated on forwardInboundMedia at
+  // the call site.
+  const sttEndpoint = (c.sttEndpoint || 'http://127.0.0.1:18068').replace(/\/+$/, '');
+  const voiceTranscribe = c.voiceTranscribe !== false;
+  const voiceTranscribeLanguage = (typeof c.voiceTranscribeLanguage === 'string' && c.voiceTranscribeLanguage.trim())
+    ? c.voiceTranscribeLanguage.trim()
+    : 'auto';
+  const voiceTranscriptToAgent = c.voiceTranscriptToAgent !== false;
+
+  /**
+   * Transcribe a downloaded voice file via the local Whisper (OpenAI-compatible)
+   * service. Mirrors dsh-tool-audio's transcribe_audio request body. Best-effort
+   * callers: on any failure this resolves to '' (logged at the call site), so a
+   * dead service can never break the reply/inject path. Returns the recognized
+   * text (trimmed) or '' on failure/empty.
+   */
+  async function transcribeVoiceFile(localPath, language, timeoutMs = 120000) {
+    try {
+      const form = new FormData();
+      form.append('file', new File([new Uint8Array(readFileSync(localPath))], 'voice.ogg', { type: 'audio/ogg' }));
+      form.append('model', 'whisper-1');
+      form.append('response_format', 'json');
+      if (language && language !== 'auto') form.append('language', language);
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(new Error(`STT timed out after ${timeoutMs}ms`)), timeoutMs);
+      let res;
+      try {
+        res = await fetch(`${sttEndpoint}/v1/audio/transcriptions`, { method: 'POST', body: form, signal: controller.signal });
+      } finally { clearTimeout(timer); }
+      if (!res.ok) {
+        const body = (await res.text().catch(() => '')).slice(0, 300);
+        log('warn', `Voice transcription failed (HTTP ${res.status}) from ${sttEndpoint}: ${body || res.statusText}`);
+        return '';
+      }
+      const payload = await res.json().catch(() => ({}));
+      const text = String(payload?.text ?? '').trim();
+      if (!text) log('warn', 'Voice transcription returned empty text (silent or unsupported audio?)');
+      return text;
+    } catch (err) {
+      log('warn', `Voice transcription error: ${err.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * Send a plain-text message (no markdown→HTML conversion) so arbitrary
+   * recognized/quoted text cannot trip Telegram's entity parser. Returns the
+   * list of sent message ids (or [] on failure — callers treat as best-effort).
+   */
+  async function sendPlainText(chatId, text, opts = {}) {
+    if (!text) return [];
+    const sent = [];
+    for (const chunk of chunkText(text, maxMessageLength)) {
+      const body = {
+        chatId,
+        text: chunk,
+        parseMode: undefined,
+        replyToMessageId: opts.replyToMessageId,
+        messageThreadId: opts.messageThreadId,
+        disableNotification: opts.disableNotification,
+      };
+      // Single retry on transient failure (this is best-effort UI, not the
+      // critical agent-reply path — keep it light).
+      let result;
+      for (let attempt = 1; ; attempt++) {
+        try { result = await client.sendMessage(body); break; }
+        catch (err) {
+          if (attempt >= 2 || !isTransientTelegramError(err)) {
+            log('warn', `sendPlainText to chat ${chatId} failed: ${err.message}`);
+            return sent;
+          }
+          const delayMs = err instanceof TelegramRateLimitError ? err.retryAfter * 1000 : 1000;
+          await sleep(delayMs);
+        }
+      }
+      // Only the first chunk is threaded as a reply; keep the rest plain.
+      body.replyToMessageId = undefined;
+      sent.push(result.messageId);
+    }
+    return sent;
+  }
+
   /**
    * Transcode a WAV to OGG Opus (Telegram voice format) using ffmpeg.
    * @returns {Promise<{ oggPath: string, duration: number }>}
@@ -1248,14 +1350,14 @@ export async function apply(ctx, config) {
     const kind = inboundMediaKind(message);
     const fileId = inboundMediaFileId(message);
     if (!fileId) {
-      return { note: `(the user sent a ${kind} with no downloadable file)`, imageBlock: null };
+      return { note: `(the user sent a ${kind} with no downloadable file)`, imageBlock: null, localPath: null };
     }
     let dl;
     try {
       dl = await client.downloadFile(fileId, inboundMediaDir);
     } catch (err) {
       log('warn', `Inbound ${kind} download failed: ${err.message}`);
-      return { note: `(the user sent a ${kind} but it could not be downloaded: ${err.message})`, imageBlock: null };
+      return { note: `(the user sent a ${kind} but it could not be downloaded: ${err.message})`, imageBlock: null, localPath: null };
     }
 
     // Human/agent-facing description.
@@ -1303,7 +1405,7 @@ export async function apply(ctx, config) {
         }
       }
     }
-    return { note, imageBlock };
+    return { note, imageBlock, localPath: dl.localPath };
   }
 
   // -----------------------------------------------------------------------
@@ -2443,6 +2545,24 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
               const fm = await downloadAndDescribeInboundMedia(message);
               mediaNote = fm.note;
               imageBlock = fm.imageBlock;
+
+              // Inbound voice: transcribe ONCE, then (a) reply with the text
+              // directly under the voice bubble — the only way to show it "on the
+              // next line" in Telegram — and (b) reuse the SAME transcript in the
+              // agent note so it already has the words (no 2nd transcribe_audio).
+              if (inboundMediaKind(message) === 'voice' && voiceTranscribe && fm.localPath) {
+                const transcript = await transcribeVoiceFile(fm.localPath, voiceTranscribeLanguage);
+                if (transcript) {
+                  void sendPlainText(String(message.chatId), `🎧 ${transcript}`, {
+                    replyToMessageId: message.messageId,
+                    messageThreadId: message.messageThreadId,
+                    disableNotification: true,
+                  });
+                  if (voiceTranscriptToAgent) {
+                    mediaNote += ` Whisper transcription (already read; do NOT call transcribe_audio): “${transcript}”`;
+                  }
+                }
+              }
             }
 
             // DSH's MessageSource requires kind ∈ {user, plugin, model, tool}.

@@ -337,9 +337,16 @@ await test('option tap answers with the selected label and settles the card', as
   assert.equal(r.result.ok, true);
   assert.equal(r.result.value.sessionId, 'telegram-abc');
   assert.deepEqual(r.result.value.answer.answers, [{ id: 'lang', selected: ['English'] }]);
-  // card settled → edited to answered state
+  // card settled → re-rendered LOCKED: the question text stays on screen, the
+  // chosen option is shown, and every button is disabled (nothing re-selectable).
   await sleep(1);
-  assert.ok(client.calls.edits.some((e) => e.text.includes('✅ 已回答')));
+  const settled = client.calls.edits.find((e) => e.text.includes('🔒 已提交：English'));
+  assert.ok(settled, 'card settled to a locked state showing the chosen option');
+  assert.ok(settled.text.includes(singleQ.question), 'question text is retained after submit');
+  const rows = settled.replyMarkup?.inline_keyboard ?? [];
+  assert.ok(rows.length >= 2, 'locked card keeps its keyboard');
+  const allButtons = rows.flat();
+  assert.ok(allButtons.length > 0 && allButtons.every((b) => b.is_disabled), 'all buttons disabled after submit');
   // ack sent
   assert.ok(client.calls.acks.length >= 1);
 });
@@ -570,9 +577,12 @@ await test('a question/resolved frame settles our card (web answered first)', as
   await request(mod, client, 'rpc-res', 'telegram-abc', [singleQ]);
   mod.handleFrame({ payload: { type: 'question/resolved', questionRpcId: 'rpc-res', outcome: 'answered' } });
   await sleep(1);
-  // Settled as delegated (web won) — NO respond() call from us.
+  // Settled as delegated (web won) — NO respond() call from us. The card is
+  // locked with a neutral "已作答" label (the old "🌐 已在网页端回答" wording was
+  // removed) while the question stays on screen.
   assert.equal(state.responses.length, 0);
-  assert.ok(client.calls.edits.some((e) => e.text.includes('🌐')));
+  assert.ok(client.calls.edits.some((e) => e.text.includes('🔒 已作答')));
+  assert.ok(!client.calls.edits.some((e) => e.text.includes('🌐')));
 });
 
 await test('a late respond that is not-pending settles as delegated, not answered', async () => {
@@ -589,7 +599,45 @@ await test('a late respond that is not-pending settles as delegated, not answere
   await mod.handleCallbackQuery({ id: 'late1', data: btn(kb, ':cancel').callback_data });
   await sleep(1);
   assert.equal(state.responses.length, 1);
-  assert.ok(client.calls.edits.some((e) => e.text.includes('🌐')));
+  // not-pending ⇒ settled as delegated with a neutral label, never "🌐 网页端".
+  assert.ok(client.calls.edits.some((e) => e.text.includes('🔒 已作答')));
+  assert.ok(!client.calls.edits.some((e) => e.text.includes('🌐')));
+});
+
+// Regression for the reported bug: when we submit, the host ACCEPTS our
+// answer and broadcasts `question/resolved` back to us (its echo of OUR
+// settlement). That echo must NOT re-collapse the card into a status line —
+// the card must stay locked (question retained, buttons disabled), exactly as
+// our accepted-receipt settlement rendered it.
+await test('the host resolved-echo of our own submit does not re-collapse the card', async () => {
+  const client = makeClient();
+  const state = { responses: [] };
+  const mod = createQuestionModule({
+    log: () => {},
+    escape: esc,
+    client,
+    ownership: () => ({ chatId: '123', threadId: null }),
+    respond: async (b) => {
+      state.responses.push(b);
+      // Simulate the host: accepting the answer broadcasts `question/resolved`
+      // back to us (its echo of our own settlement) before the receipt returns.
+      setTimeout(() => mod.handleFrame({ payload: { type: 'question/resolved', questionRpcId: b.rpcId, outcome: 'answered' } }), 0);
+      return { accepted: true };
+    },
+  });
+  const kb = await request(mod, client, 'rpc-echo', 'telegram-abc', [singleQ]);
+  await mod.handleCallbackQuery({ id: 'ech1', data: btn(kb, ':q0:1').callback_data });
+  await sleep(2);
+  const settled = client.calls.edits.filter((e) => e.text.includes('🔒 已提交：English'));
+  assert.ok(settled.length >= 1, 'card settles to the locked "已提交" state');
+  // The echo must not have turned the card back into a bare status line.
+  assert.ok(!client.calls.edits.some((e) => e.text.trim() === '🔒 已作答'), 'no bare "已作答" status line');
+  assert.ok(!client.calls.edits.some((e) => e.text.includes('🌐')), 'no "已在网页端回答" wording');
+  // The final card keeps the full question and a fully-disabled keyboard.
+  const last = client.calls.edits.at(-1);
+  assert.ok(last.text.includes(singleQ.question), 'question text retained in final card');
+  const rows = last.replyMarkup?.inline_keyboard ?? [];
+  assert.ok(rows.length > 0 && rows.flat().every((b) => b.is_disabled), 'all buttons disabled in final card');
 });
 
 await test('stale callback (unknown/expired key) acks but does not respond', async () => {

@@ -140,7 +140,31 @@ dsh web --patch ./cordis.yml
 | `questionsEnabled` | boolean | `true` | When the agent calls `ask_user_question` (pick an option / type your own), post an inline-keyboard question card to the owning chat and answer via the web host, so a phone-only user isn't left waiting on the browser. See "Question cards" below. |
 | `questionsForDefaultAgent` | boolean | `true` | Also surface questions from the deployment's **shared default agent** to the phone (mirrors `approvalForDefaultAgent`). Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
 | `webUrl` | string | `''` | Loopback base URL of the `dsh web` host the plugin reaches for question events/responses. Defaults to `DSH_WEB_URL` (set by `dsh web`), then `http://127.0.0.1:3080`. Override only for non-default ports. |
+| `sttEndpoint` | string | `http://127.0.0.1:18068` | OpenAI-compatible Whisper base URL used to transcribe inbound voice notes (same service `dsh-tool-audio`'s `transcribe_audio` hits). |
+| `voiceTranscribe` | boolean | `true` | When the user sends a voice note, transcribe it and reply with the text under the voice bubble (🎧). Requires `forwardInboundMedia`. |
+| `voiceTranscribeLanguage` | string | `auto` | Force a language code (e.g. `zh`/`en`) for transcription, or `auto` to let Whisper detect it. |
+| `voiceTranscriptToAgent` | boolean | `true` | Also include the transcript in the message injected to the agent, so it already has the words and does NOT re-run `transcribe_audio`. |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
+
+### Inbound voice transcription (🎧)
+
+When the user sends a **voice note**, the plugin transcribes it via the local
+Whisper service (`sttEndpoint`, default the same proxy `transcribe_audio` uses)
+and, in the same step:
+
+1. **Replies with the recognized text directly under the voice bubble** — a reply
+   to the voice message is the only way to show it "on the next line" (Telegram
+   bots cannot edit another user's message). It is a quiet, plain-text message
+   (`🎧 …`) so arbitrary recognized text can't trip the entity parser.
+2. **Reuses that transcript in the note injected to the agent**, so the agent
+   already has the spoken words and does **not** need to call `transcribe_audio`
+   again (saves a round-trip and lets the agent answer immediately).
+
+Requires `forwardInboundMedia: true` (the file must be downloaded to transcribe).
+The transcript is shown verbatim — no LLM re-phrase — so display is fast and
+cost-free. The whole feature is best-effort: if the service is down or the audio
+is silent, the voice note is still injected and answered normally (just no
+transcript line). Set `voiceTranscribe: false` to turn it off.
 
 ### Live trajectory (tool calls + thinking)
 

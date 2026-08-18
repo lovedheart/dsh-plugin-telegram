@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.9] - 2026-08-18
+
+### Changed
+- **Answered question cards stay on screen (locked) instead of collapsing.**
+  When a question is settled, the card was previously edited down to a single
+  status line (`✅ 已回答：…` / `🌐 已在网页端回答`), so the question and its
+  options disappeared from the chat. Now `settle()` re-renders each card with
+  its options retained but **disabled** (`is_disabled` — Telegram greys them
+  out and tapping fires no callback), a final status line showing what was
+  chosen (`🔒 已提交：…`), and all control buttons locked. The question is
+  readable and nothing can be re-selected.
+
+### Fixed
+- **The user's own submit no longer mislabels the card "已在网页端回答".**
+  Submitting via Telegram makes the web host accept the answer and broadcast a
+  `question/resolved` frame back to us; `onResolved` used to settle the card
+  as "delegated" from that echo, racing the legitimate `respond()` receipt.
+  The entry is now flagged `settling` across the `respond()` await, so the
+  host's echo of our own settlement is ignored and the authoritative receipt
+  decides the label.
+- **Removed the "🌐 已在网页端回答" wording.** When the web GUI answers first
+  (we never submitted), the locked card now shows a neutral `🔒 已作答`.
+
+### Added
+- `lockedKeyboard(kind, key, qi)` helper and `settled` state on the card
+  builders; regression test for the resolved-echo race.
+- **Inbound voice transcription (🎧).** When the user sends a voice note, the
+  plugin transcribes it via the local Whisper service (`sttEndpoint`, default
+  the same `http://127.0.0.1:18068` proxy `transcribe_audio` uses) and, in the
+  same step: (1) replies with the recognized text **directly under the voice
+  bubble** — a reply to the voice message is the only way to show it "on the
+  next line" (Telegram bots cannot edit another user's message); and (2) reuses
+  the same transcript in the note injected to the agent, so it already has the
+  spoken words and does **not** re-run `transcribe_audio`. The transcript is
+  shown verbatim (no LLM re-phrase) so display is fast and cost-free. The
+  whole feature is best-effort — a dead service or silent audio still injects
+  and answers the voice note normally, just without a transcript line. New
+  config: `sttEndpoint`, `voiceTranscribe` (default `true`),
+  `voiceTranscribeLanguage` (default `auto`), `voiceTranscriptToAgent`
+  (default `true`). Requires `forwardInboundMedia`.
+
 ## [0.4.8] - 2026-08-18
 
 ### Fixed

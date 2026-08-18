@@ -125,6 +125,28 @@ function optionRows(qi, labeled, disabled) {
   return rows;
 }
 
+// Locked keyboard for a SETTLED card: the control buttons stay on screen but
+// disabled (is_disabled), so Telegram renders them greyed-out and tapping fires
+// no callback — the question "freezes" in place with its choices visible and
+// nothing re-selectable. The option rows keep their real labels (so the
+// question still reads normally); only the final control row is locked.
+//   kind 'single'  → single-question card  → [🔒 已提交]
+//   kind 'multiq'  → one card in a multi-question flow → [🔒 已提交本题]
+//   kind 'summary' → progress/summary card   → [🔒 已提交全部]
+// `qi` only disambiguates the lock callback_data on the per-question card.
+export function lockedKeyboard(kind, key, qi = 0) {
+  const cb = (a) => `${QUESTION_CALLBACK_PREFIX}${key || 'KEY'}:${a}`;
+  const lock = kind === 'summary'
+    ? { text: '🔒 已提交全部', callback_data: cb('submit') }
+    : kind === 'multiq'
+      ? { text: '🔒 已提交本题', callback_data: cb(`lock:q${qi}`) }
+      : { text: '🔒 已提交', callback_data: cb('lock:q0') };
+  return [
+    [{ ...lock, is_disabled: true }],
+    [{ text: '❌ 取消', callback_data: cb('cancel'), is_disabled: true }],
+  ];
+}
+
 // Question body lines: question, detail?, numbered option descriptions
 // (models frequently put the real substance in option.description — it used
 // to be silently dropped, making cards look "incomplete". Numbering follows
@@ -144,6 +166,22 @@ function questionBodyParts(q, qi, multi, esc) {
 
 const joinLines = (parts) => parts.filter((p, i) => !(p === '' && i > 0 && parts[i - 1] === '')).join('\n');
 
+// One-line status for a SETTLED card. `settled` = { outcome, note }; `chosen`
+// is the question's selected labels (per-question scope). The question text
+// and options stay on screen (see the builders); this line just records the
+// final state. Note: when the web GUI answered first (delegated) we say a
+// neutral "已作答" — the resolved frame carries no per-option payload and
+// pointing the user at the web UI was the source of the "题目消失" complaint.
+function settleStatusLine(esc, settled, chosen) {
+  if (settled.outcome === 'answered') {
+    const what = chosen.length ? esc(chosen.join('，')) : (settled.note ? esc(settled.note) : '');
+    return what ? `🔒 已提交：${what}` : '🔒 已提交';
+  }
+  if (settled.outcome === 'cancelled') return '⌛ 已取消';
+  if (settled.outcome === 'rejected') return '⚠️ 提交被拒绝，请重新提问';
+  return '🔒 已作答';
+}
+
 /**
  * Build a SINGLE-question card {text (plain — caller escapes nothing; we
  * escape via dep), keyboard}. `escape` is injected (index.js escapeHtml) so
@@ -152,28 +190,37 @@ const joinLines = (parts) => parts.filter((p, i) => !(p === '' && i > 0 && parts
  * adaptive option rows, then [✅ 提交] (only when multi-select) + [❌ 取消].
  * A plain-text reply to this card is consumed as a custom answer.
  */
-export function buildQuestionCard(questions, escape, selections = new Map()) {
+export function buildQuestionCard(questions, escape, selections = new Map(), settled = null) {
   const esc = escape || ((s) => String(s ?? ''));
   const q = questions[0];
   const parts = ['❓ 需要你回答'];
   const keyboard = [];
   if (q.header) parts.push('', esc(q.header));
   parts.push(...questionBodyParts(q, 0, false, esc));
-  keyboard.push(...optionRows(0, labeledOptions(q), false));
-  if (q.multiSelect) {
-    const chosen = selections.get(q.id) || [];
-    // Keep the "how to finish" hint visible AFTER selecting too — otherwise
-    // the user taps an option, sees only "已选：xxx", and has no idea the
-    // answer still needs an explicit 提交 tap.
-    parts.push(chosen.length
-      ? `🔘 已选：${esc(chosen.join('，'))}（可继续点选，完成后点「✅ 提交」）`
-      : `🔘 可多选，选完点「✅ 提交」`);
+  const chosen = selections.get(q.id) || [];
+  if (settled) {
+    // Card is final: keep the question and the chosen options on screen,
+    // disable every button (nothing can be re-selected), drop the type-a-reply
+    // hint (a reply would only be treated as a fresh custom answer).
+    keyboard.push(...optionRows(0, labeledOptions(q), true));
+    parts.push(settleStatusLine(esc, settled, chosen));
+    keyboard.push(...lockedKeyboard('single', 'KEY'));
+  } else {
+    keyboard.push(...optionRows(0, labeledOptions(q), false));
+    if (q.multiSelect) {
+      // Keep the "how to finish" hint visible AFTER selecting too — otherwise
+      // the user taps an option, sees only "已选：xxx", and has no idea the
+      // answer still needs an explicit 提交 tap.
+      parts.push(chosen.length
+        ? `🔘 已选：${esc(chosen.join('，'))}（可继续点选，完成后点「✅ 提交」）`
+        : `🔘 可多选，选完点「✅ 提交」`);
+    }
+    const finalRow = [];
+    if (q.multiSelect) finalRow.push({ text: '✅ 提交', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:submit` });
+    finalRow.push({ text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` });
+    keyboard.push(finalRow);
+    parts.push('', '💬 也可以直接回复这条消息输入你的答案。');
   }
-  const finalRow = [];
-  if (q.multiSelect) finalRow.push({ text: '✅ 提交', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:submit` });
-  finalRow.push({ text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` });
-  keyboard.push(finalRow);
-  parts.push('', '💬 也可以直接回复这条消息输入你的答案。');
   return { text: joinLines(parts), keyboard };
 }
 
@@ -186,27 +233,31 @@ export function buildQuestionCard(questions, escape, selections = new Map()) {
  * per-question lock button (✅ 提交本题); the shared 🏁 提交全部 lives on the
  * summary card (buildSummaryCard).
  */
-export function buildQuestionCardFor(q, qi, total, escape, selections = new Map(), locked = new Set()) {
+export function buildQuestionCardFor(q, qi, total, escape, selections = new Map(), locked = new Set(), settled = null) {
   const esc = escape || ((s) => String(s ?? ''));
   const isLocked = locked.has(q.id);
   const parts = [`❓ 需要你回答（${qi + 1}/${total}）`];
   if (q.header) parts.push('', esc(q.header));
   parts.push(...questionBodyParts(q, qi, true, esc));
   const chosen = selections.get(q.id) || [];
-  if (isLocked) {
+  const keyboard = optionRows(qi, labeledOptions(q), Boolean(settled) || isLocked);
+  if (settled) {
+    // Final state: keep the question + chosen options on screen, lock every
+    // button. Per-question status depends on the outcome (see settleStatusLine).
+    parts.push(settleStatusLine(esc, settled, chosen));
+    keyboard.push(...lockedKeyboard('multiq', 'KEY', qi));
+  } else if (isLocked) {
     parts.push(chosen.length ? `🔒 已提交：${esc(chosen.join('，'))}` : '🔒 未作答（已跳过）');
+    keyboard.push([{ text: '🔒 已提交本题', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:lock:q${qi}`, is_disabled: true }, { text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` }]);
   } else if (q.multiSelect) {
     parts.push(chosen.length
       ? `🔘 已选：${esc(chosen.join('，'))}（可继续点选，然后点「✅ 提交本题」）`
       : `🔘 可多选，选完点「✅ 提交本题」`);
+    keyboard.push([{ text: '✅ 提交本题', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:lock:q${qi}` }, { text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` }]);
   } else {
     parts.push(chosen.length ? `🔘 已选：${esc(chosen.join('，'))}` : '🔘 未选择');
+    keyboard.push([{ text: '✅ 提交本题', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:lock:q${qi}` }, { text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` }]);
   }
-  const keyboard = optionRows(qi, labeledOptions(q), isLocked);
-  const lockBtn = isLocked
-    ? { text: '🔒 已提交本题', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:lock:q${qi}`, is_disabled: true }
-    : { text: '✅ 提交本题', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:lock:q${qi}` };
-  keyboard.push([lockBtn, { text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` }]);
   return { text: joinLines(parts), keyboard };
 }
 
@@ -216,10 +267,24 @@ export function buildQuestionCardFor(q, qi, total, escape, selections = new Map(
  * Its 🏁 提交全部 button submits whatever has been selected so far —
  * unanswered questions go back empty (skipped).
  */
-export function buildSummaryCard(entry, escape) {
+export function buildSummaryCard(entry, escape, settled = null) {
   const esc = escape || ((s) => String(s ?? ''));
   const total = entry.questions.length;
   const done = entry.questions.filter((q) => entry.locked.has(q.id)).length;
+  if (settled) {
+    // Final progress card: every question is done, so mark all ✅, drop the
+    // instructional hint, and lock the submit row.
+    const parts = [`📝 答题进度：${total}/${total}`];
+    entry.questions.forEach((q, qi) => {
+      parts.push(`✅ ${esc(q.header || `第${qi + 1}题`)}`);
+    });
+    parts.push('', settleStatusLine(esc, settled, []));
+    const keyboard = [
+      [{ text: '🔒 已提交全部', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:submit`, is_disabled: true }],
+      [{ text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel`, is_disabled: true }],
+    ];
+    return { text: joinLines(parts), keyboard };
+  }
   const parts = [`📝 答题进度：${done}/${total}`];
   entry.questions.forEach((q, qi) => {
     parts.push(`${entry.locked.has(q.id) ? '✅' : '⬜'} ${esc(q.header || `第${qi + 1}题`)}`);
@@ -278,19 +343,31 @@ export function createQuestionModule(deps) {
     // DSH mints fresh per ask, but a reconnect replay could re-deliver — still
     // can't double-post. Bounded: entries leave the set on settle.
     seenRpcIds.delete(entry.rpcId);
-    const label =
-      outcome === 'answered' ? `✅ 已回答${note ? `：${note}` : ''}`
-      : outcome === 'cancelled' ? '⌛ 已取消'
-      : outcome === 'rejected' ? '⚠️ 提交被拒绝，请重新提问'
-      : '🌐 已在网页端回答';
-    // Multi-question flows post one card per question plus a summary card —
-    // settle every message that was posted.
-    const targets = [...entry.cardMessageIds, ...(entry.summaryMessageId ? [entry.summaryMessageId] : [])];
-    for (const mid of targets) {
-      if (!mid) continue;
+    // Keep the question on screen: instead of collapsing each card to a single
+    // status line (the old behaviour made the whole question "disappear"),
+    // re-render it with its options disabled (locked — nothing can be
+    // re-selected) and a final status line showing what was chosen. The web
+    // answer path (delegated) no longer says "已在网页端回答" — it uses a
+    // neutral label, per the user's request.
+    const settled = { outcome, note };
+    const edit = (mid, text, kb) => {
+      if (!mid) return;
       Promise.resolve()
-        .then(() => deps.client.editMessageText(entry.chatId, mid, label, undefined))
+        .then(() => deps.client.editMessageText(entry.chatId, mid, text, 'HTML', kb ? { inline_keyboard: kb } : undefined))
         .catch(() => { /* card may already be gone */ });
+    };
+    const subKey = (kb) => kb.map((row) =>
+      row.map((b) => ({ ...b, callback_data: b.callback_data.replace('KEY', entry.key) })));
+    if (entry.questions.length === 1) {
+      const { text, keyboard } = buildQuestionCard(entry.questions, deps.escape, entry.selections, settled);
+      edit(entry.cardMessageIds[0], text, subKey(keyboard));
+    } else {
+      entry.questions.forEach((q, qi) => {
+        const { text, keyboard } = buildQuestionCardFor(entry.questions[qi], qi, entry.questions.length, deps.escape, entry.selections, entry.locked, settled);
+        edit(entry.cardMessageIds[qi], text, subKey(keyboard));
+      });
+      const s = buildSummaryCard(entry, deps.escape, settled);
+      edit(entry.summaryMessageId, s.text, subKey(s.keyboard));
     }
   }
 
@@ -337,9 +414,21 @@ export function createQuestionModule(deps) {
       };
     }
     let receipt;
+    // We are about to POST our answer. The web host, upon accepting it,
+    // broadcasts a `question/resolved` frame back to us — that echo is OUR own
+    // settlement, not the web UI answering. Keep `settling` true across the
+    // whole await + settle so onResolved ignores the frame: the respond()
+    // receipt (below) is the authoritative signal for our own submit, so a
+    // racing frame can neither mislabel it "已作答" nor win the race. The flag
+    // is intentionally NOT cleared afterwards — the entry leaves `pending` in
+    // settle(), so the flag becomes inert.
+    entry.settling = true;
     try {
       receipt = await deps.respond(body);
     } catch (err) {
+      // Respond failed: we never settled, so a LATER web-first frame must be
+      // allowed to settle the card — clear the guard (the entry stays pending).
+      entry.settling = false;
       deps.log?.('error', `Question respond failed (will let web UI settle it): ${err.message}`);
       return false;
     }
@@ -454,10 +543,17 @@ export function createQuestionModule(deps) {
   function onResolved(payload) {
     const rpcId = payload.questionRpcId;
     for (const entry of [...pending.values()]) {
-      if (entry.rpcId === rpcId) {
-        settle(entry, payload.outcome === 'answered' ? 'delegated' : 'cancelled');
-        return;
-      }
+      if (entry.rpcId !== rpcId) continue;
+      // Skip the host's echo of OUR OWN settlement: while we're POSTing our
+      // answer (and settling on its receipt), the host's accepted-claim
+      // broadcasts a `question/resolved: answered` frame back to us. Treating
+      // it as "web GUI answered first" would mislabel the user's own submit.
+      // The respond() receipt (in answer()) is the authoritative signal here.
+      if (entry.settling) return;
+      // A frame that reaches us when we are NOT submitting our own answer means
+      // the web GUI answered first — lock the card with a neutral "已作答".
+      settle(entry, payload.outcome === 'answered' ? 'delegated' : 'cancelled');
+      return;
     }
   }
 
