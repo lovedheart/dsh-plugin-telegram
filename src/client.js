@@ -7,8 +7,8 @@
  * @module dsh-plugin-telegram/client
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { extname, join, dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
+import { extname, join, dirname, basename, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const DEFAULT_BASE_URL = 'https://api.telegram.org';
@@ -133,6 +133,125 @@ async function tgFetchOk(baseUrl, botToken, method, body, signal, timeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
+// Local-file upload helpers (multipart/form-data)
+//
+// The JSON _api channel cannot upload a local binary to the Bot API; for that
+// we POST multipart/form-data. This is the same mechanism sendVoiceFile used
+// inline; it is now a shared helper so document/photo/video/audio can all send
+// local files too (previously only voice could, forcing the agent to upload
+// documents to a public host first).
+// ---------------------------------------------------------------------------
+
+const MEDIA_MIME = {
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.zip': 'application/zip',
+  '.gz': 'application/gzip',
+  '.tar': 'application/x-tar',
+  '.log': 'text/plain',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.svg': 'image/svg+xml',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.m4a': 'audio/mp4',
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.webm': 'video/webm',
+};
+
+/** MIME type for a filename by extension; falls back to application/octet-stream. */
+function mimeOf(filename) {
+  return MEDIA_MIME[extname(String(filename)).toLowerCase()] || 'application/octet-stream';
+}
+
+/**
+ * True when `value` denotes a LOCAL file (not a Telegram file_id, not a URL).
+ * A file_id is a bare opaque token (no scheme, no path separator); a URL has
+ * an http(s) scheme; anything else we treat as a local path.
+ */
+function isLocalFilePath(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  if (/^https?:\/\//i.test(value)) return false;       // URL → send by reference
+  if (/^[A-Za-z0-9_=-]+$/.test(value)) return false;    // looks like a file_id
+  return true;                                          // local path
+}
+
+/**
+ * POST a local file to a Bot API media method via multipart/form-data.
+ * @param {string} baseUrl
+ * @param {string} botToken
+ * @param {string} method      e.g. 'sendDocument'
+ * @param {string} field       Bot API media field, e.g. 'document'
+ * @param {string} chatId
+ * @param {string} filePath    Absolute local file path.
+ * @param {object} [extra]     Optional extra form fields (caption, title, ...).
+ * @param {string} [extra.caption]
+ * @param {string} [extra.parseMode]
+ * @param {number} [extra.messageThreadId]
+ * @param {string} [extra.title]
+ * @param {string} [extra.performer]
+ * @param {number} [extra.duration]
+ * @param {AbortSignal} [signal]
+ * @param {number} [timeoutMs]
+ * @returns {Promise<{ messageId: number, chatId: string }>}
+ */
+async function tgUploadFile(baseUrl, botToken, method, field, chatId, filePath, extra = {}, signal, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+  const data = readFileSync(filePath);
+  const fileName = basename(filePath) || 'upload';
+  const mime = mimeOf(fileName);
+
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  if (extra.messageThreadId) form.append('message_thread_id', String(extra.messageThreadId));
+  if (extra.caption) {
+    form.append('caption', extra.caption);
+    if (extra.parseMode) form.append('parse_mode', extra.parseMode);
+  }
+  if (extra.title) form.append('title', extra.title);
+  if (extra.performer) form.append('performer', extra.performer);
+  if (extra.duration != null && Number.isFinite(Number(extra.duration))) {
+    form.append('duration', String(Math.round(Number(extra.duration))));
+  }
+  form.append(field, new Blob([data], { type: mime }), fileName);
+
+  const url = `${baseUrl}/bot${botToken}/${method}`;
+  const resp = await fetch(url, { method: 'POST', body: form, signal: withTimeout(signal, timeoutMs) });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+    const errorCode = parsed && typeof parsed.error_code === 'number' ? parsed.error_code : undefined;
+    const description = parsed?.description || `${resp.status} ${resp.statusText}`;
+    if (errorCode === 429 || resp.status === 429) {
+      const retryAfter = parsed?.parameters?.retry_after;
+      throw new TelegramRateLimitError(Number(retryAfter) > 0 ? Number(retryAfter) : 5);
+    }
+    throw new TelegramApiError(`Telegram API ${method} (upload) failed: ${description}`, text, resp.status, errorCode);
+  }
+  const data2 = await resp.json();
+  const msg = data2?.result;
+  if (!msg) throw new Error(`${method} (upload) returned no result`);
+  return { messageId: Number(msg.message_id), chatId: String(msg.chat?.id ?? chatId) };
+}
+
+// ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
 
@@ -214,7 +333,25 @@ export class TelegramClient {
     }
   }
 
+  /**
+   * Ensure a media reference is a usable local path. Returns an absolute path
+   * when `ref` is a local file, or null when it is a URL / file_id (sent by
+   * reference). Throws for a local path that does not point at a regular file.
+   */
+  _localPathOr(ref) {
+    if (!isLocalFilePath(ref)) return null;
+    const abs = resolve(ref);
+    const st = statSync(abs, { throwIfNoEntry: false });
+    if (!st || !st.isFile()) throw new Error(`local file not found or not a regular file: ${abs}`);
+    return abs;
+  }
+
   async sendPhoto(opts) {
+    const local = this._localPathOr(opts.photo);
+    if (local) {
+      return tgUploadFile(this.baseUrl, this.botToken, 'sendPhoto', 'photo',
+        opts.chatId, local, { caption: opts.caption, parseMode: opts.parseMode, messageThreadId: opts.messageThreadId }, opts.signal);
+    }
     const body = {
       chat_id: String(opts.chatId),
       photo: opts.photo,
@@ -234,6 +371,11 @@ export class TelegramClient {
   }
 
   async sendDocument(opts) {
+    const local = this._localPathOr(opts.document);
+    if (local) {
+      return tgUploadFile(this.baseUrl, this.botToken, 'sendDocument', 'document',
+        opts.chatId, local, { caption: opts.caption, parseMode: opts.parseMode, messageThreadId: opts.messageThreadId }, opts.signal);
+    }
     const body = {
       chat_id: String(opts.chatId),
       document: opts.document,
@@ -253,6 +395,11 @@ export class TelegramClient {
   }
 
   async sendVideo(opts) {
+    const local = this._localPathOr(opts.video);
+    if (local) {
+      return tgUploadFile(this.baseUrl, this.botToken, 'sendVideo', 'video',
+        opts.chatId, local, { caption: opts.caption, parseMode: opts.parseMode, messageThreadId: opts.messageThreadId }, opts.signal);
+    }
     const body = {
       chat_id: String(opts.chatId),
       video: opts.video,
@@ -272,6 +419,13 @@ export class TelegramClient {
   }
 
   async sendAudio(opts) {
+    const local = this._localPathOr(opts.audio);
+    if (local) {
+      return tgUploadFile(this.baseUrl, this.botToken, 'sendAudio', 'audio',
+        opts.chatId, local,
+        { caption: opts.caption, parseMode: opts.parseMode, messageThreadId: opts.messageThreadId, title: opts.title, performer: opts.performer, duration: opts.duration },
+        opts.signal);
+    }
     const body = {
       chat_id: String(opts.chatId),
       audio: opts.audio,
@@ -306,45 +460,12 @@ export class TelegramClient {
    * @param {AbortSignal} [opts.signal]
    */
   async sendVoiceFile(opts) {
-    const data = readFileSync(opts.filePath);
-    const fileName = String(opts.filePath).split('/').pop() || 'voice.ogg';
-
-    const form = new FormData();
-    form.append('chat_id', String(opts.chatId));
-    if (opts.messageThreadId) form.append('message_thread_id', String(opts.messageThreadId));
-    if (opts.duration != null && Number.isFinite(Number(opts.duration))) {
-      form.append('duration', String(Math.round(Number(opts.duration))));
-    }
-    if (opts.caption) form.append('caption', opts.caption);
-    form.append('voice', new Blob([data], { type: 'audio/ogg' }), fileName);
-
-    const url = `${this.baseUrl}/bot${this.botToken}/sendVoice`;
-    const resp = await fetch(url, {
-      method: 'POST',
-      body: form,
-      signal: withTimeout(opts.signal, DEFAULT_REQUEST_TIMEOUT_MS),
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
-      let parsed;
-      try { parsed = JSON.parse(text); } catch { parsed = null; }
-      const errorCode = parsed && typeof parsed.error_code === 'number' ? parsed.error_code : undefined;
-      const description = parsed?.description || `${resp.status} ${resp.statusText}`;
-      if (errorCode === 429 || resp.status === 429) {
-        const retryAfter = parsed?.parameters?.retry_after;
-        throw new TelegramRateLimitError(Number(retryAfter) > 0 ? Number(retryAfter) : 5);
-      }
-      throw new TelegramApiError(`Telegram API sendVoice failed: ${description}`, text, resp.status, errorCode);
-    }
-
-    const data2 = await resp.json();
-    const msg = data2?.result;
-    if (!msg) throw new Error('sendVoice returned no result');
-    return {
-      messageId: Number(msg.message_id),
-      chatId: String(msg.chat?.id ?? opts.chatId),
-    };
+    // Voice is always a local OGG file (produced by the plugin's TTS/transcode
+    // step), so it always goes through the multipart uploader.
+    return tgUploadFile(this.baseUrl, this.botToken, 'sendVoice', 'voice',
+      opts.chatId, opts.filePath,
+      { caption: opts.caption, messageThreadId: opts.messageThreadId, duration: opts.duration },
+      opts.signal);
   }
 
   async answerCallbackQuery(queryId, text, showAlert) {

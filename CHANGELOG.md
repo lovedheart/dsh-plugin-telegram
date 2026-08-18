@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.5] - 2026-06-29
+
+### Added
+- **Local files can now be sent straight to Telegram** (no more public-host
+  round-trip). `telegram_send_document` / `telegram_send_photo` /
+  `telegram_send_video` / `telegram_send_audio` now accept an **absolute local
+  file path** in their media parameter — in addition to a Telegram file_id or a
+  public URL. Local paths are uploaded to the Bot API via
+  `multipart/form-data`, with the MIME type inferred from the file extension
+  (PDF, Office, images, audio, video, text, archives; fallback
+  `application/octet-stream`).
+- `src/client.js`: new shared helper `tgUploadFile()` (multipart POST with
+  429/5xx/timeout handling identical to the JSON path), plus `isLocalFilePath()`
+  and `mimeOf()` for reference-vs-upload dispatch. `sendDocument` /
+  `sendPhoto` / `sendVideo` / `sendAudio` transparently route local paths
+  through it; URLs and file_ids keep the unchanged JSON behavior.
+  `sendVoiceFile` now reuses `tgUploadFile` (same OGG multipart semantics, no
+  duplicated fetch/error code).
+- `src/index.js`: tool descriptions and parameter docs updated so the model
+  knows a local absolute path is accepted; the injected per-message instruction
+  now tells the agent to pass local file paths directly to the media tools
+  instead of uploading them to a public host first.
+- `sendVideo` / `sendAudio` now forward `exec.signal` (interrupt/abort
+  propagation, previously only on text/photo/document).
+
+### Tests
+- `test/client.test.mjs`: new "local-file upload (multipart)" suite — asserts a
+  local path produces a `FormData` body with the right field name, basename and
+  inferred MIME; URL/file_id references still POST JSON (regression); a missing
+  local path throws.
+
 ## [0.4.4] - 2026-08-16
 
 ### Added

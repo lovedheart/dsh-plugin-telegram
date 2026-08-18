@@ -1376,7 +1376,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_send_photo',
-    description: 'Send a photo to a Telegram chat. The photo parameter can be a Telegram file_id (previously uploaded) or a public URL.',
+    description: 'Send a photo to a Telegram chat. The photo parameter can be a Telegram file_id (previously uploaded), a public URL, or an absolute local file path (uploaded via multipart).',
 
     parameters: {
       chat_id: {
@@ -1386,7 +1386,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       photo: {
         type: 'string',
         required: true,
-        description: 'Telegram file_id or public URL of the photo.',
+        description: 'Telegram file_id, public URL, or absolute local file path of the photo.',
       },
       caption: {
         type: 'string',
@@ -1566,6 +1566,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         caption,
         parseMode: captionParseMode,
         messageThreadId: args.message_thread_id,
+        signal: exec?.signal,
       });
 
       return `Video sent successfully (message_id: ${result.messageId})`;
@@ -1578,7 +1579,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_send_audio',
-    description: 'Send an audio file (music, podcast, etc.) to a Telegram chat. The audio parameter can be a Telegram file_id or a public URL.',
+    description: 'Send an audio file (music, podcast, etc.) to a Telegram chat. The audio parameter can be a Telegram file_id, a public URL, or an absolute local file path (uploaded via multipart).',
 
     parameters: {
       chat_id: {
@@ -1647,6 +1648,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         performer: args.performer,
         duration: args.duration,
         messageThreadId: args.message_thread_id,
+        signal: exec?.signal,
       });
 
       return `Audio sent successfully (message_id: ${result.messageId})`;
@@ -2396,10 +2398,11 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
             // DSH's MessageSource requires kind ∈ {user, plugin, model, tool}.
             // Use 'plugin' (this plugin is the source of the message) and
             // keep the chat id in the text so the agent can route replies.
+            const fileInstruction = ` To send the user a file you have locally (a PDF, image, video, audio, or any document), pass its ABSOLUTE local path directly to telegram_send_document / telegram_send_photo / telegram_send_video / telegram_send_audio — the plugin uploads it to Telegram via multipart; do NOT upload it to a public host first.`;
             const replyInstruction =
               agentResponseMode === 'direct'
-                ? `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Produce your answer as normal assistant text; the plugin will forward it back to Telegram automatically. Do NOT call telegram_send_message.`
-                : `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Reply to it using the telegram_send_message tool with chat_id: ${message.chatId}.`;
+                ? `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Produce your answer as normal assistant text; the plugin will forward it back to Telegram automatically. Do NOT call telegram_send_message.` + fileInstruction
+                : `This message comes from Telegram (chat ${message.chatId}, sender ${sender}). Reply to it using the telegram_send_message tool with chat_id: ${message.chatId}.` + fileInstruction;
 
             const bodyParts = [];
             if (message.text) {

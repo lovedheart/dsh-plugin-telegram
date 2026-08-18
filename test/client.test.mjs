@@ -160,6 +160,65 @@ await atest('POSTs sendAudio with title/performer/duration (duration coerced to 
   assert.equal(body.duration, '91'); // Math.round(90.6), stringified
 });
 
+console.log('TelegramClient local-file upload (multipart):');
+await atest('sendDocument with a local path uploads multipart with field "document"', async () => {
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tgup-'));
+  const file = path.join(dir, 'report.pdf');
+  fs.writeFileSync(file, '%PDF-1.4 fake');
+  try {
+    const f = makeFakeFetch();
+    f.enqueue({ ok: true, result: { message_id: 42, chat: { id: 555 } } });
+    globalThis.fetch = f.fn;
+    const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE });
+    const res = await c.sendDocument({ chatId: 555, document: file, caption: 'hello' });
+    globalThis.fetch = realFetch;
+    assert.ok(f.calls[0].url.endsWith('/botTK/sendDocument'), f.calls[0].url);
+    const init = f.calls[0].init;
+    assert.ok(init.body instanceof FormData, 'local path must produce a multipart FormData body');
+    const entries = {};
+    for (const [k, v] of init.body.entries()) entries[k] = v;
+    assert.equal(entries.chat_id, '555');
+    assert.equal(entries.caption, 'hello');
+    const filePart = entries.document;
+    assert.ok(filePart && filePart.name === 'report.pdf', 'file part must carry the basename');
+    assert.equal(filePart.type, 'application/pdf', 'MIME must be inferred from the .pdf extension');
+    assert.deepEqual(res, { messageId: 42, chatId: '555' });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+await atest('sendDocument with a URL still POSTs JSON (unchanged behavior)', async () => {
+  const f = makeFakeFetch();
+  f.enqueue({ ok: true, result: { message_id: 7, chat: { id: 123 } } });
+  globalThis.fetch = f.fn;
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE });
+  await c.sendDocument({ chatId: 123, document: 'https://example.com/a.pdf' });
+  globalThis.fetch = realFetch;
+  const body = JSON.parse(f.calls[0].init.body);
+  assert.equal(body.document, 'https://example.com/a.pdf');
+  assert.equal(body.chat_id, '123');
+});
+await atest('sendDocument with a file_id still POSTs JSON (unchanged behavior)', async () => {
+  const f = makeFakeFetch();
+  f.enqueue({ ok: true, result: { message_id: 7, chat: { id: 123 } } });
+  globalThis.fetch = f.fn;
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE });
+  await c.sendDocument({ chatId: 123, document: 'file_id_ABC-123' });
+  globalThis.fetch = realFetch;
+  const body = JSON.parse(f.calls[0].init.body);
+  assert.equal(body.document, 'file_id_ABC-123');
+});
+await atest('sendDocument with a missing local path throws', async () => {
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: CLIENT_BASE });
+  await assert.rejects(
+    () => c.sendDocument({ chatId: 1, document: '/no/such/file.pdf' }),
+    /not found|regular file/,
+  );
+});
+
 console.log('TelegramClient.getFile:');
 await atest('resolves a file_id to { filePath, fileSize, fileName }', async () => {
   const f = makeFakeFetch();

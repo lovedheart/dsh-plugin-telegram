@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-telegram",
   "description": "DSH plugin for Telegram bot integration - send/receive messages via Telegram Bot API",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -19,6 +19,6 @@
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.7"
   }
 }
