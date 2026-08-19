@@ -45,6 +45,7 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `/model list` | 列出可用 provider/model |
 | `/model <provider>:<model>` | 为当前会话切换模型（下一轮请求生效） |
 | `/approval` | 查看已记住的「一直允许」授权（`/approval clear` 清空全部，`/approval <ruleKey>` 清单条） |
+| `/autopilot` | 全自动模式（`on`/`off`/`status`）：全局写权限 + 自动放行授权 + 自动采纳推荐方案（⚠️ 有安全隐患） |
 | `/start` 或 `/help` | 显示帮助 |
 
 普通消息路由到当前聊天的 active 会话；无显式路由时落到默认（第一个）会话。
@@ -139,11 +140,19 @@ dsh web --patch ./cordis.yml
 | `approvalAlwaysPath` | string | `''` | File where "🔁 一直允许" remembers are persisted (defaults to `$DSH_HOME/telegram-approval-always.json`). Set an absolute path to relocate. |
 | `questionsEnabled` | boolean | `true` | When the agent calls `ask_user_question` (pick an option / type your own), post an inline-keyboard question card to the owning chat and answer via the web host, so a phone-only user isn't left waiting on the browser. See "Question cards" below. |
 | `questionsForDefaultAgent` | boolean | `true` | Also surface questions from the deployment's **shared default agent** to the phone (mirrors `approvalForDefaultAgent`). Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
+| `autopilotEnabled` | boolean | `true` | Whether the `/autopilot` command is available. Set `false` to disable full-auto mode entirely. See "Autopilot (full-auto mode)" below. |
+| `autopilotSandboxMode` | string | `danger-full-access` | Sandbox mode appended to the session while a chat is in autopilot (the "global write" half). Defaults to full disk access. |
+| `autopilotWindowMs` | number | `10000` | How long an autopilot `ask_user_question` notice waits before auto-committing the recommended option (`0` = commit immediately). Gives you a window to tap `✋ 接管` to take over. |
 | `webUrl` | string | `''` | Loopback base URL of the `dsh web` host the plugin reaches for question events/responses. Defaults to `DSH_WEB_URL` (set by `dsh web`), then `http://127.0.0.1:3080`. Override only for non-default ports. |
 | `sttEndpoint` | string | `http://127.0.0.1:18068` | OpenAI-compatible Whisper base URL used to transcribe inbound voice notes (same service `dsh-tool-audio`'s `transcribe_audio` hits). |
 | `voiceTranscribe` | boolean | `true` | When the user sends a voice note, transcribe it and reply with the text under the voice bubble (🎧). Requires `forwardInboundMedia`. |
 | `voiceTranscribeLanguage` | string | `auto` | Force a language code (e.g. `zh`/`en`) for transcription, or `auto` to let Whisper detect it. |
 | `voiceTranscriptToAgent` | boolean | `true` | Also include the transcript in the message injected to the agent, so it already has the words and does NOT re-run `transcribe_audio`. |
+| `subagentBoardEnabled` | boolean | `true` | While a session spawns subagents, keep ONE pinned message per chat showing each subagent live (task + status, and what it is doing). See "Live subagent board" below. |
+| `subagentBoardPin` | boolean | `true` | Pin the board message so it stays at the top of the chat (the "fixed" part). |
+| `subagentBoardRefreshMs` | number | `2000` | How often the board re-reads live child sessions and re-renders (edits are throttled to ~1.5 s regardless). |
+| `subagentBoardIncludeDescendants` | boolean | `false` | When `true`, also show nested subagents (a subagent that spawns another). Default shows only direct children. |
+| `subagentBoardMaxRows` | number | `10` | Cap on subagents shown before the overflow collapses into a `… 另有 K 个未显示` line (keeps the message under Telegram's 4096-char limit). |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
 
 ### Inbound voice transcription (🎧)
@@ -185,6 +194,51 @@ It is deleted the moment the turn ends (`turn/end`), self-cleans after
 `progressTimeoutSec`, and never shows for turns that finish before `progressDelaySec`.
 Set `progressEnabled: false` to turn it off. It is purely best-effort — a Telegram
 failure never affects the real reply.
+
+### Live subagent board (🧩)
+
+When a session spawns **subagents** (via the `subagent` / `subagent_fork` tools), the
+plugin keeps a **single pinned message per chat** that shows, in real time, every
+subagent currently working — and each finished one, locked in place. Each subagent
+occupies **at most two lines**:
+
+```
+🧩 子代理看板 · 2 工作中 / 1 完成
+🟢 重构认证模块 · 工作中
+🔧 read src/auth/session.js
+🟢 跑集成测试 · 工作中
+正在启动…
+✅ 整理依赖 · 已完成
+已完成 · 用时 42s
+```
+
+- **Line 1** — status emoji + a short task name + status word (`工作中` / `已完成` / …).
+  The task name comes from the child's `subagent/descriptor` label (or the `subagent`
+  tool call's `description`), truncated to fit.
+- **Line 2** — what it is doing **right now**: the child's most recent tool call
+  (`🔧 name + args`), else its latest reasoning, else `正在启动…` until activity appears.
+- **Real-time** — a ticker re-reads the live child sessions every
+  `subagentBoardRefreshMs` (default 2 s) and edits the same message in place
+  (edits are throttled to ~1.5 s so Telegram's edit rate limit is never hit).
+- **Pinned** — the board message is pinned on first subagent (the "fixed" part) so it
+  stays at the top of the chat; `subagentBoardPin: false` disables pinning.
+- **Locked on end** — when a subagent finishes (`subagent/end`), its row **freezes**
+  with the terminal state and elapsed time and is never re-read. A re-start (a
+  continuable child waking for a new epoch) re-opens the row as working.
+
+Lifecycle edges come from DSH's `subagent/start` / `subagent/end` events (a global
+listener, so the parent-scope filter is bypassed). A **presence sweep** of the live
+`agents.list()` runs on the same ticker as a backstop: it starts any child the event
+bus missed and locks any that vanished (after a short grace), so the board stays
+correct even on a host where the events never reach the plugin. Only **direct
+children** are shown by default; set `subagentBoardIncludeDescendants: true` to include
+nested subagents. The overflow beyond `subagentBoardMaxRows` collapses into a
+`… 另有 K 个未显示` line to keep the message under Telegram's 4096-char limit.
+
+`/new` (or `/clear`) tears down the chat's board (unpin + delete); the board is also
+torn down on plugin unload. Set `subagentBoardEnabled: false` to turn the feature off.
+Like the progress indicator it is purely best-effort — a Telegram hiccup never
+affects the real reply or the subagents themselves.
 
 ### Tool-guard approval (permission prompts on the phone)
 
@@ -266,6 +320,49 @@ plugin adds a Telegram answerer:
 
 Questions from **other (web-only) agents** are left to the browser — you won't
 see duplicate cards. Set `questionsEnabled: false` to turn this off.
+
+### Autopilot (full-auto mode)
+
+`/autopilot` turns on a per-chat "reach the goal without hand-holding" mode —
+the Telegram counterpart of a global `/goal`. It is **opt-in per chat** and
+**explicitly warned** on enable, because it grants real power:
+
+1. **Global write permission.** Enabling autopilot appends a
+   `sandbox/mode = danger-full-access` event to the session, so bash/fs calls run
+   with full disk access until you turn it off. On `/autopilot off`, the
+   previously-captured mode is re-applied (default `workspace-write`).
+2. **No permission prompts.** While a chat is in autopilot, the plugin's
+   `approval/request` answerer auto-grants every ask instead of posting a card.
+   Sandbox **escalations** route through the same answerer, so the agent reaches
+   full write without ever blocking on a prompt. A short silent notice is posted
+   so you can see what was auto-approved.
+3. **Auto-adopt recommended answers.** While autopilot is on, an
+   `ask_user_question` card auto-selects the agent's **recommended** option and
+   commits after the `autopilotWindowMs` takeover window (default `10s`). The
+   notice card lists all options + the one locked, with `⏩ 立即采纳` (commit now)
+   and `✋ 接管` (stop autopilot for the chat + answer manually).
+
+**Commands:** `/autopilot` or `/autopilot on` enable; `/autopilot off` disables
+(and restores the prior sandbox mode); `/autopilot status` reports state.
+
+> **Security warning.** Autopilot grants global write + auto-approves tool and
+> sandbox escalations and auto-answers questions. There is a real risk of
+> unintended, hard-to-reverse actions. Only enable it in a chat/session you trust
+> and watch the silent notices. Set `autopilotEnabled: false` to remove the
+> command entirely.
+>
+> **How the auto-allow works (not the `danger-full-access` preset).** The plugin
+> does **not** switch to the `danger-full-access` permission preset or set
+> `approval/policy: 'never'` — `never` *rejects* asks before dispatch rather than
+> auto-allowing, which would break approvals. The auto-allow lives in this plugin's
+> own `approval/request` answerer; the approval policy stays `ask`.
+
+**Recommended-option convention.** For auto-adoption to pick the right answer,
+the agent should put its **recommended** option **first** and tag its label with
+`（推荐）` / `recommended`. While a chat is in autopilot the plugin injects this
+instruction into every forwarded message (see [AGENT_INTEGRATION](AGENT_INTEGRATION.md)).
+`pickRecommended` locks on the `推荐`/`recommended` marker, else falls back to the
+first option.
 
 ## Creating a Telegram Bot
 
@@ -385,17 +482,20 @@ dsh-plugin-telegram/
 ├── README.md           # This file
 ├── src/
 │   ├── index.js        # Main plugin entry (tools + polling + agent injection)
-│   ├── client.js       # Telegram Bot API HTTP client
+│   ├── client.js       # Telegram Bot API HTTP client (incl. pin/unpin)
 │   ├── poller.js       # Long-polling background service
-│   └── text.js         # Pure text helpers (Markdown→HTML, fence-aware chunking)
+│   ├── text.js         # Pure text helpers (Markdown→HTML, fence-aware chunking)
+│   └── subagents.js    # Live subagent board (state, render, throttled flush)
 ├── test/
 │   ├── text.test.mjs   # Unit tests for the pure text helpers
-│   └── client.test.mjs # Unit tests for transient-error classification (npm test runs both)
+│   ├── client.test.mjs # Unit tests for transient-error classification
+│   └── subagents.test.mjs # Unit tests for the subagent board
 └── lib/                # Built output (copy of src/; `npm run prepare`)
     ├── index.js
     ├── client.js
     ├── poller.js
-    └── text.js
+    ├── text.js
+    └── subagents.js
 ```
 
 ## References

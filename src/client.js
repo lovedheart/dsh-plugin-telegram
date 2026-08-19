@@ -333,6 +333,34 @@ export class TelegramClient {
     }
   }
 
+  // Pin / unpin a message so it stays at the top of the chat (used to keep the
+  // live subagent board "fixed" per the feature spec). Best-effort: returns a
+  // boolean and never throws, so a pin failure (e.g. bot lacks the right, or a
+  // "no new message to pin") can never break the board's edit/send path.
+  async pinChatMessage(chatId, messageId, disableNotification = true) {
+    try {
+      const body = {
+        chat_id: String(chatId),
+        message_id: messageId,
+      };
+      if (disableNotification) body.disable_notification = true;
+      await this._api('pinChatMessage', body);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async unpinChatMessage(chatId, messageId) {
+    try {
+      const body = { chat_id: String(chatId), message_id: messageId };
+      await this._api('unpinChatMessage', body);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Ensure a media reference is a usable local path. Returns an absolute path
    * when `ref` is a local file, or null when it is a URL / file_id (sent by

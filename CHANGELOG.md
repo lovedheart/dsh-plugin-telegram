@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-08-19
+
+### Added
+- **Live subagent board (🧩) — real-time, pinned subagent status on Telegram.**
+  While a session spawns subagents (`subagent` / `subagent_fork`), the plugin
+  keeps **one pinned message per chat** showing every subagent live — a short
+  task name + status (line 1) and what it is doing right now (line 2), **at most
+  two lines each**. Rows **lock** when a subagent ends (terminal state + elapsed
+  time). Lifecycle edges come from `subagent/start` / `subagent/end` (a global
+  listener); a presence sweep of the live `agents.list()` is the always-on
+  backstop. Config: `subagentBoardEnabled` (on), `subagentBoardPin` (on),
+  `subagentBoardRefreshMs` (2000), `subagentBoardIncludeDescendants` (off),
+  `subagentBoardMaxRows` (10). New: `src/subagents.js`, `pinChatMessage` /
+  `unpinChatMessage` in `client.js`, `test/subagents.test.mjs`.
+- **`/autopilot` — full-auto "reach the goal" mode (per chat).**
+  `/autopilot` (or `on`) turns on autopilot for the current chat; `/autopilot off`
+  stops it; `/autopilot status` reports state. It is the Telegram counterpart of a
+  global `/goal`: the agent runs toward the objective without per-step permission
+  friction.
+
+  - **Global write permission** — enabling autopilot appends a
+    `sandbox/mode = danger-full-access` event to the session, so bash/fs calls run
+    with full disk access for the duration of the chat. On `/autopilot off` the
+    previously-captured mode is re-applied (default `workspace-write`).
+  - **No permission prompts** — while a chat is in autopilot, the plugin's
+    `approval/request` answerer auto-grants every ask (`allowed-once`) instead of
+    posting a card. This is the "no prompts" half of global permissions: sandbox
+    **escalations** also flow through this answerer, so the agent reaches full
+    write without blocking. A one-line notice (silent, no button) is posted so the
+    user can see what was auto-approved.
+  - **Auto-adopt recommended answers** — while autopilot is on, `ask_user_question`
+    cards auto-select the agent's **recommended** option and commit after a short
+    **takeover window** (default `10s`). A notice card lists all options + the one
+    locked, with `⏩ 立即采纳` (commit now) and `✋ 接管` (disable autopilot + answer
+    manually). Taking over restores normal interactive answering for that chat.
+
+  **Security:** enabling autopilot prints an explicit warning that it grants global
+  write + auto-approves tool/sandbox escalations and has a real security risk.
+
+  > Implementation note: autopilot does **not** use the `danger-full-access`
+  > permission preset or `approval/policy: 'never'` — `never` **rejects** asks
+  > before dispatch rather than auto-allowing, so it would break approvals. The
+  > auto-allow lives in this plugin's own `approval/request` answerer; the
+  > approval policy stays `ask`.
+
+  New config (all optional): `autopilotEnabled` (default `true`),
+  `autopilotSandboxMode` (default `danger-full-access`), `autopilotWindowMs`
+  (default `10000`; `0` = commit immediately).
+
+- **Recommended-option convention (documented).** For autopilot auto-adoption to
+  pick the right answer, the agent should place its **recommended** option **first**
+  and tag its label with `（推荐）` / `recommended`. The plugin injects this
+  instruction into every message it forwards while a chat is in autopilot; see
+  README + AGENT_INTEGRATION. `pickRecommended` locks on the `推荐`/`recommended`
+  marker, else falls back to the first option.
+
+### Changed
+- `/help` and the bot command menu now list `/autopilot`.
+- Bumped `0.4.9 → 0.5.0`.
+
 ## [0.4.9] - 2026-08-18
 
 ### Changed

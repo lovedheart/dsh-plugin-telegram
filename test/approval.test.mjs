@@ -161,6 +161,97 @@ await (async () => {
     assert.equal(client.calls.sends.length, 0);
   });
 
+  console.log('createApprovalModule: autopilot auto-allow');
+  await test('autopilot chat -> allowed-once with NO approval card', async () => {
+    const { client, mod } = makeModule({ deps: { isAutopilot: () => true } });
+    let nextCalled = false;
+    const p = mod.handleApprovalRequest(
+      { agent: tgAgent('telegram-x'), toolName: 'bash', reason: 'need write' },
+      () => { nextCalled = true; return Promise.resolve('unavailable'); },
+    );
+    const out = await p;
+    await sleep(10); // let the (best-effort) notice flush
+    assert.equal(out, 'allowed-once');
+    assert.equal(nextCalled, false, 'must not delegate when autopilot grants');
+    // No interactive approval card is posted. The only send is the info notice,
+    // which carries disableNotification and no keyboard.
+    assert.equal(client.calls.sends.length, 1);
+    assert.equal(client.calls.sends[0].disableNotification, true);
+    assert.equal(client.calls.sends[0].replyMarkup, undefined);
+    assert.ok(client.calls.sends[0].text.includes('Autopilot'));
+    assert.ok(client.calls.edits.length === 0, 'no card to edit');
+  });
+  await test('autopilot notice posts ONCE per chat; clearAutopilotNotice re-arms it', async () => {
+    const { client, mod } = makeModule({ deps: { isAutopilot: () => true } });
+    const ask = async () => {
+      const out = await mod.handleApprovalRequest(
+        { agent: tgAgent('telegram-x'), toolName: 'bash' },
+        () => Promise.resolve('unavailable'),
+      );
+      assert.equal(out, 'allowed-once');
+      await sleep(10);
+    };
+    await ask();
+    await ask();
+    await ask();
+    assert.equal(client.calls.sends.length, 1, 'only the first auto-grant posts the notice');
+    assert.ok(client.calls.sends[0].text.includes('Autopilot'));
+    // A fresh /autopilot cycle clears the flag → next grant notices again.
+    mod.clearAutopilotNotice('123');
+    await ask();
+    assert.equal(client.calls.sends.length, 2, 'notice re-armed after clear');
+  });
+  await test('autopilot notices are independent per chat (same module, different chats)', async () => {
+    const { client, mod } = makeModule({
+      deps: {
+        isAutopilot: () => true,
+        // telegram-1 -> chat 111, telegram-2 -> chat 222
+        ownership: (agent) => {
+          const sid = String(agent?.session?.id ?? '');
+          if (sid === 'telegram-1') return { chatId: '111', threadId: null };
+          if (sid === 'telegram-2') return { chatId: '222', threadId: null };
+          return null;
+        },
+      },
+    });
+    const ask = async (agentId) => {
+      await mod.handleApprovalRequest({ agent: tgAgent(agentId), toolName: 'bash' }, () => Promise.resolve('unavailable'));
+      await sleep(10);
+    };
+    await ask('telegram-1');
+    await ask('telegram-1'); // suppressed (same chat)
+    await ask('telegram-2'); // different chat → noticed again
+    assert.equal(client.calls.sends.length, 2, 'one notice per chat, not per grant');
+    assert.equal(String(client.calls.sends[0].chatId), '111');
+    assert.equal(String(client.calls.sends[1].chatId), '222');
+  });
+  await test('autopilot notice never breaks the outcome if send fails', async () => {
+    const { client, mod } = makeModule({
+      deps: { isAutopilot: () => true, client: makeClient({ failSend: () => new Error('boom') }) },
+    });
+    // failSend throws on EVERY send including the notice; the outcome must still
+    // be allowed-once (the notice is best-effort and swallowed).
+    const out = await mod.handleApprovalRequest(
+      { agent: tgAgent('telegram-x'), toolName: 'bash' },
+      () => Promise.resolve('unavailable'),
+    );
+    assert.equal(out, 'allowed-once');
+    void client;
+  });
+  await test('non-autopilot chat still posts a card (isAutopilot false)', async () => {
+    const { client, mod } = makeModule({ deps: { isAutopilot: () => false } });
+    const p = mod.handleApprovalRequest(
+      { agent: tgAgent('telegram-x'), toolName: 'bash' },
+      () => Promise.resolve('unavailable'),
+    );
+    await sleep(15);
+    // A real approval card (with a keyboard) is posted, not the notice.
+    assert.ok(client.calls.sends.length >= 1);
+    assert.ok(client.calls.sends[0].replyMarkup, 'approval card has a keyboard');
+    mod.cancelAll(); // clear the pending card + its 60s timer so the process can exit
+    p.catch(() => {});
+  });
+
   console.log('createApprovalModule: approve / deny flow');
   await test('approve button resolves allowed-once and acks + edits', async () => {
     const { client, mod } = makeModule();

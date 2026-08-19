@@ -69,6 +69,41 @@ Reply to it using the telegram_send_message tool with chat_id: 123456789.`,
    - **direct** mode: plugin awaits the turn finishing (agent idle + a new
      assistant message) and calls `telegram_send_message` with the final text
 
+## Autopilot — recommended option convention
+
+When a chat is in **autopilot** mode (see README "Autopilot (full-auto mode)"),
+the plugin auto-adopts the agent's **recommended** option for every
+`ask_user_question` and commits it after a short takeover window. To make that
+auto-adoption pick the *right* answer, follow this convention whenever you call
+`ask_user_question`:
+
+- Put the **recommended** option **first** in `options`.
+- Tag its `label` with **`（推荐）`** (or `recommended`). Example:
+
+  ```json
+  {
+    "questions": [{
+      "id": "stack",
+      "question": "选用哪种实现？",
+      "options": [
+        { "label": "方案 A（推荐）", "description": "改动小、可回滚" },
+        { "label": "方案 B", "description": "更彻底但风险高" },
+        { "label": "方案 C", "description": "折中" }
+      ]
+    }]
+  }
+  ```
+
+Detection (`pickRecommended`): scan each option's `label`+`description` for
+`推荐` / `recommend`; the first flagged option is auto-adopted (single-select) or
+all flagged ones (multi-select). With **no** marker it falls back to the **first**
+option — which is why "recommended first" is the convention. The plugin also
+injects this same instruction into every forwarded message while a chat is in
+autopilot, so agents see it even without reading this doc.
+
+> If a question has **no** auto-pickable option, autopilot falls back to the
+> normal interactive card instead of guessing.
+
 ## Debugging
 
 Check the terminal output for:

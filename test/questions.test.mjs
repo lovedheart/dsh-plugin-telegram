@@ -13,6 +13,7 @@ import {
   displayWidth,
   buttonsPerRow,
   effectiveMultiSelect,
+  pickRecommended,
 } from '../src/questions.js';
 
 let passed = 0, failed = 0;
@@ -54,7 +55,7 @@ function makeClient(overrides = {}) {
  * Build a question module wired to a mock client + ownership + responder.
  * Returns the module and a handle to inspect what was posted/responded.
  */
-function makeModule({ ownership, failSend } = {}) {
+function makeModule({ ownership, failSend, isAutopilot, autopilotWindowMs = 0, autopilotTakeover } = {}) {
   const client = makeClient({ failSend });
   const state = { responses: [] };
   const deps = {
@@ -67,6 +68,11 @@ function makeModule({ ownership, failSend } = {}) {
       return { accepted: true };
     },
   };
+  if (typeof isAutopilot === 'function') {
+    deps.isAutopilot = isAutopilot;
+    deps.autopilotWindowMs = autopilotWindowMs;
+    if (typeof autopilotTakeover === 'function') deps.autopilotTakeover = autopilotTakeover;
+  }
   const mod = createQuestionModule(deps);
   return { mod, client, state };
 }
@@ -315,6 +321,54 @@ await test('effectiveMultiSelect: infers from wording only when flag is absent',
   // Single-select wording with no flag stays single.
   assert.equal(effectiveMultiSelect({ question: '选哪种语言？' }), false);
   assert.equal(effectiveMultiSelect({ question: '请选择一个' }), false);
+});
+
+// ---------------------------------------------------------------------------
+// pickRecommended — autopilot auto-adopt option selection
+// ---------------------------------------------------------------------------
+console.log('\npickRecommended:');
+await test('returns the flagged 推荐 option even when not first', () => {
+  const q = { id: 'x', question: 'q', options: [
+    { label: 'A. 慢' },
+    { label: 'B. 快（推荐）', description: '更快' },
+    { label: 'C. 最慢' },
+  ] };
+  assert.deepEqual(pickRecommended(q), ['B. 快（推荐）']);
+});
+await test('matches the English "recommended" marker in the description', () => {
+  const q = { id: 'x', question: 'q', options: [
+    { label: 'A' },
+    { label: 'B', description: '(recommended)' },
+  ] };
+  assert.deepEqual(pickRecommended(q), ['B']);
+});
+await test('falls back to the FIRST option when nothing is flagged', () => {
+  const q = { id: 'x', question: 'q', options: [{ label: 'First' }, { label: 'Second' }] };
+  assert.deepEqual(pickRecommended(q), ['First']);
+});
+await test('single-select caps at one option even with multiple flags', () => {
+  const q = { id: 'x', question: 'q', options: [
+    { label: 'A（推荐）' },
+    { label: 'B（推荐）' },
+  ] };
+  assert.deepEqual(pickRecommended(q), ['A（推荐）']);
+});
+await test('multi-select returns every flagged option', () => {
+  const q = { id: 'x', question: 'q', multiSelect: true, options: [
+    { label: 'A' },
+    { label: 'B（推荐）' },
+    { label: 'C（推荐）' },
+  ] };
+  assert.deepEqual(pickRecommended(q), ['B（推荐）', 'C（推荐）']);
+});
+await test('returns [] when there are no options', () => {
+  assert.deepEqual(pickRecommended({ id: 'x', question: 'q', options: [] }), []);
+  assert.deepEqual(pickRecommended({ id: 'x', question: 'q' }), []);
+});
+await test('returns raw labels (not truncated display text)', () => {
+  const long = 'y'.repeat(80);
+  const q = { id: 'x', question: 'q', options: [{ label: long }] };
+  assert.deepEqual(pickRecommended(q), [long]);
 });
 
 // ---------------------------------------------------------------------------
@@ -658,6 +712,82 @@ await test('cancelAll on unload forgets pending cards without network', async ()
   await mod.handleCallbackQuery({ id: 'u1', data: btn(kb, ':cancel').callback_data });
   await sleep(1);
   assert.equal(state.responses.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Autopilot auto-adopt (v0.5.0)
+// ---------------------------------------------------------------------------
+const apQ = { id: 'lang', question: '选哪种语言？', options: [
+  { label: '中文（推荐）' },
+  { label: 'English' },
+] };
+
+console.log('\ncreateQuestionModule: autopilot');
+await test('window=0: autopilot posts the auto card and commits the recommended option', async () => {
+  const { mod, client, state } = makeModule({ isAutopilot: () => true, autopilotWindowMs: 0 });
+  mod.handleFrame({ rpcId: 'rpc-ap0', payload: { type: 'question/requested', sessionId: 'telegram-abc', questions: [apQ] } });
+  await sleep(5);
+  // One autopilot notice card posted.
+  assert.equal(client.calls.sends.length, 1);
+  const kb = client.calls.sends[0].replyMarkup.inline_keyboard;
+  assert.ok(kb.flat().some((b) => b.callback_data.endsWith(':adopt') && b.text === '⏩ 立即采纳'));
+  assert.ok(kb.flat().some((b) => b.callback_data.endsWith(':takeover')));
+  // Committed automatically with the recommended (first) option.
+  await sleep(5);
+  assert.equal(state.responses.length, 1);
+  assert.deepEqual(state.responses[0].result.value.answer.answers, [{ id: 'lang', selected: ['中文（推荐）'] }]);
+  // Card settled to a locked state.
+  await sleep(1);
+  assert.ok(client.calls.edits.length >= 1);
+});
+await test('window>0: schedules the commit; ✋ takeover goes manual + re-renders the interactive card', async () => {
+  let tookOver = null;
+  const { mod, client, state } = makeModule({
+    isAutopilot: () => true, autopilotWindowMs: 60_000, autopilotTakeover: (c) => { tookOver = c; },
+  });
+  mod.handleFrame({ rpcId: 'rpc-ap1', payload: { type: 'question/requested', sessionId: 'telegram-abc', questions: [apQ] } });
+  await sleep(5);
+  const kb = client.calls.sends[0].replyMarkup.inline_keyboard;
+  // Not yet answered (window pending).
+  assert.equal(state.responses.length, 0);
+  // Tap ✋ 接管 → calls autopilotTakeover, re-renders the normal interactive card.
+  await mod.handleCallbackQuery({ id: 'ap1t', data: btn(kb, ':takeover').callback_data });
+  await sleep(5);
+  assert.equal(tookOver, '123', 'takeover disables autopilot for the chat');
+  assert.equal(state.responses.length, 0, 'takeover must NOT submit');
+  // The card is now the interactive one (option buttons back, no adopt button).
+  const lastEdit = client.calls.edits.at(-1);
+  const rows = lastEdit.replyMarkup?.inline_keyboard ?? [];
+  assert.ok(rows.flat().some((b) => b.callback_data.endsWith(':q0:0')), 'interactive option buttons restored');
+  assert.ok(!rows.flat().some((b) => b.callback_data.endsWith(':adopt')), 'adopt button gone');
+});
+await test('window>0: ⏩ 立即采纳 commits immediately with the recommended option', async () => {
+  const { mod, client, state } = makeModule({ isAutopilot: () => true, autopilotWindowMs: 60_000 });
+  mod.handleFrame({ rpcId: 'rpc-ap2', payload: { type: 'question/requested', sessionId: 'telegram-abc', questions: [apQ] } });
+  await sleep(5);
+  const kb = client.calls.sends[0].replyMarkup.inline_keyboard;
+  assert.equal(state.responses.length, 0);
+  await mod.handleCallbackQuery({ id: 'ap2a', data: btn(kb, ':adopt').callback_data });
+  await sleep(5);
+  assert.equal(state.responses.length, 1);
+  assert.deepEqual(state.responses[0].result.value.answer.answers, [{ id: 'lang', selected: ['中文（推荐）'] }]);
+});
+await test('autopilot falls back to the normal card when no option is auto-pickable', async () => {
+  const noPick = { id: 'x', question: 'q', options: [] }; // empty options → pickRecommended []
+  const { mod, client, state } = makeModule({ isAutopilot: () => true, autopilotWindowMs: 0 });
+  mod.handleFrame({ rpcId: 'rpc-ap3', payload: { type: 'question/requested', sessionId: 'telegram-abc', questions: [noPick] } });
+  await sleep(5);
+  // No autopilot card (no auto-pick) → normal interactive card instead.
+  assert.equal(client.calls.sends.length, 1);
+  const kb = client.calls.sends[0].replyMarkup.inline_keyboard;
+  assert.ok(!kb.flat().some((b) => b.callback_data.endsWith(':adopt')), 'no autopilot adopt button');
+  assert.equal(state.responses.length, 0, 'must not auto-submit an empty answer');
+});
+await test('non-autopilot chat: isAutopilot false → normal interactive card (no adopt)', async () => {
+  const { mod, client } = makeModule({ isAutopilot: () => false });
+  const kb = await request(mod, client, 'rpc-ap4', 'telegram-abc', [apQ]);
+  assert.ok(!kb.flat().some((b) => b.callback_data.endsWith(':adopt')), 'no autopilot button when off');
+  assert.ok(kb.flat().some((b) => b.callback_data.endsWith(':q0:0')), 'normal option buttons present');
 });
 
 // ---------------------------------------------------------------------------
