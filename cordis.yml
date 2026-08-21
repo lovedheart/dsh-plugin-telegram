@@ -5,6 +5,12 @@
         # Token 可以不填，通过环境变量 TELEGRAM_BOT_TOKEN 传入
         # botToken: 'YOUR_BOT_TOKEN'
         # 或者设置环境变量: export TELEGRAM_BOT_TOKEN='your_token'
+        # 多 bot：用 bots 数组（每个 bot 独立 token/envKey，见 README "多 bot：设置多个 token"）
+        # bots:
+        #   - id: alice
+        #     envKey: 'TELEGRAM_BOT_TOKEN'
+        #   - id: bob
+        #     envKey: 'TELEGRAM_BOT_TOKEN_BOB'
         # Optional: base URL for self-hosted Telegram API
         # baseUrl: 'https://tg.local-bot-api.domain.com'
         # Default chat ID to send messages to when none is specified

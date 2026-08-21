@@ -11,6 +11,9 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 - **Edit and delete** existing messages
 - **Long-polling** for incoming messages (optional)
 - **Agent integration**: Inject Telegram messages into DSH agent loop for AI-powered conversations
+- **Multi-bot**: run several Telegram bots in one plugin instance (`bots:` config, per-bot tokens/routing, isolated state)
+- **Live subagent board**: pinned real-time subagent status (🧩) per chat
+- **`/autopilot`**: per-chat fully-autonomous mode (global write + auto-approve + auto-adopt)
 - **Access control** via allowed chats/users lists
 - **Automatic reconnection** with exponential backoff
 - **Rate limit handling** with Telegram API compliance
