@@ -218,6 +218,10 @@ const defaults = {
 // so array fields accept both 'array' and 'object'.
 const schema = {
   botToken: ['string'],
+  // Multi-bot list (v0.5.x). Optional; absent/[]/{}-coerced => single-bot
+  // fallback to the top-level fields below (see normalizeBots). Same
+  // 'array'|'object' tolerance as other array fields (YAML may coerce [] → {}).
+  bots: ['array', 'object'],
   baseUrl: ['string'],
   allowedChats: ['array', 'object'],
   allowedUsers: ['array', 'object'],
@@ -313,13 +317,13 @@ function isUsableCredential(hit) {
   return '';
 }
 
-async function resolveBotToken(configToken, ctx) {
+export async function resolveBotToken(configToken, ctx, envKey = 'TELEGRAM_BOT_TOKEN') {
   // 1. 明文配置
   if (configToken && configToken.trim().length > 0) {
     return configToken.trim();
   }
-  // 2. 环境变量
-  const envToken = process.env.TELEGRAM_BOT_TOKEN;
+  // 2. 环境变量（per-bot envKey；多 bot 时各 bot 各读各的，互不串）
+  const envToken = envKey ? process.env[envKey] : undefined;
   if (envToken && envToken.length > 0) {
     return envToken;
   }
@@ -327,7 +331,7 @@ async function resolveBotToken(configToken, ctx) {
   for (const svc of [ctx.credentials, ctx.get?.('credentials')]) {
     if (!svc || typeof svc.resolve !== 'function') continue;
     try {
-      const hit = await svc.resolve('TELEGRAM_BOT_TOKEN');
+      const hit = await svc.resolve(envKey || 'TELEGRAM_BOT_TOKEN');
       const value = isUsableCredential(hit);
       if (value) return value;
     } catch {
@@ -820,11 +824,265 @@ export class ProgressIndicator {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-bot configuration (v0.5.x)
+//
+// `bots` is an OPTIONAL config list. Each entry is a full bot config; any
+// field omitted on an entry falls back to the TOP-LEVEL config of the same
+// name (so the legacy single-bot config keeps working unchanged).
+//
+//   bots:
+//     - id: 'main'            # optional; auto-generated, see below
+//       token: ''             # optional; '' -> envKey / credentialKey lookup
+//       envKey: 'TELEGRAM_BOT_TOKEN'
+//       credentialKey: 'TELEGRAM_BOT_TOKEN'
+//       baseUrl: ''           # optional; '' -> top-level baseUrl -> TELEGRAM_BASE_URL
+//       defaultChatId: ''
+//       allowedChats: []
+//       allowedUsers: []
+//       ... (per-bot overrides of the top-level fields)
+//
+// Fallback contract (Phase 0):
+//   - no `bots` field, or `bots` === [] / {} (YAML may coerce [] -> {}):
+//       -> single bot, id 'default', built from the top-level fields
+//          (token = top-level botToken, resolved later via resolveBotToken).
+//   - `bots` is a non-empty array: each item is validated field-by-field.
+//   - id auto-generation: item.id || (token ? 'bot-' + token.slice(0,8) : 'default')
+//   - duplicate ids throw at STARTUP (before any client is created).
+//
+// normalizeBots is a PURE function (no ctx, no async) so it can be unit-
+// tested and reused by later refactors; token RESOLUTION still happens in
+// the apply() loop below (resolveBotToken is async and per-bot).
+// ---------------------------------------------------------------------------
+
+// Per-bot fields that exist on the TOP-LEVEL config and can be overridden per
+// item. Each entry: [field, normalize] where normalize() coerces the value to
+// a legal type (same tolerance as the top-level schema: e.g. [] may arrive
+// as {} from YAML). `token` is the canonical per-bot token field; `botToken`
+// is kept as an alias so either name works on an item.
+const BOT_ITEM_FIELDS = {
+  token: (v) => (typeof v === 'string' ? v : ''),
+  botToken: (v) => (typeof v === 'string' ? v : ''),
+  envKey: (v) => (typeof v === 'string' ? v : 'TELEGRAM_BOT_TOKEN'),
+  credentialKey: (v) => (typeof v === 'string' ? v : 'TELEGRAM_BOT_TOKEN'),
+  baseUrl: (v) => (typeof v === 'string' ? v : ''),
+  defaultChatId: (v) => (typeof v === 'string' ? v : (typeof v === 'number' ? String(v) : '')),
+  allowedChats: (v) => (Array.isArray(v) ? v : (v && typeof v === 'object' ? Object.values(v) : [])),
+  allowedUsers: (v) => (Array.isArray(v) ? v : (v && typeof v === 'object' ? Object.values(v) : [])),
+  requireMention: (v) => v === true,
+  injectToAgent: (v) => v !== false,
+  agentResponseMode: (v) => (typeof v === 'string' ? v : 'tool'),
+  longPollTimeout: (v) => (v !== '' && Number.isFinite(Number(v)) ? Number(v) : 30),
+  maxMessageLength: (v) => (v !== '' && Number.isFinite(Number(v)) ? Number(v) : 4000),
+  parseMode: (v) => (typeof v === 'string' ? v : 'HTML'),
+  pollingEnabled: (v) => v === true,
+  replyPrefix: (v) => (typeof v === 'string' ? v : ''),
+};
+
+/**
+ * Validate + normalize ONE bot item from the `bots` list.
+ *
+ * Contract (see test T6): INVALID field types are NORMALIZED to a legal type
+ * (never throw, never pass through raw) — e.g. allowedChats:'x' -> [],
+ * requireMention:1 -> false, defaultChatId:123 -> '123'. Unknown fields are
+ * dropped. The returned object carries legal types for every known field
+// (values left unset on the item are `undefined` — normalizeBots fills those
+// in from the top-level config). Throws only for a non-object item or a
+// non-empty-string id (structural errors that cannot be coerced).
+ */
+export function validateBotItem(item) {
+  if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+    throw new Error('bots[] item must be an object, got ' + (item === null ? 'null' : Array.isArray(item) ? 'array' : typeof item));
+  }
+  const out = {};
+  for (const [field, normalize] of Object.entries(BOT_ITEM_FIELDS)) {
+    out[field] = field in item ? normalize(item[field]) : undefined;
+  }
+  if ('id' in item) {
+    if (typeof item.id !== 'string' || !item.id.trim()) {
+      throw new Error(`bots[].id must be a non-empty string, got ${JSON.stringify(item.id)}`);
+    }
+    out.id = item.id.trim();
+  }
+  return out;
+}
+
+/**
+ * Normalize the raw `bots` config into the canonical list used by apply().
+ *
+ *   normalizeBots(undefined, top) -> [ { id:'default', token: top.botToken, ...top fields } ]
+ *   normalizeBots([], top)        -> same single-bot fallback
+ *   normalizeBots({}, top)        -> same (YAML coerces [] -> {})
+ *   normalizeBots([...], top)     -> per-item validation + per-field fallback
+ *
+ * `top` is the merged top-level plugin config. Throws on structural errors
+ * (non-array/non-object items, non-string ids, duplicate ids).
+ */
+export function normalizeBots(raw, topConfig) {
+  const top = topConfig && typeof topConfig === 'object' ? topConfig : {};
+  const singleFallback = () => {
+    // Legacy single-bot path: one entry built purely from the top-level
+    // fields. id is 'default' regardless of whether botToken is set, so the
+    // legacy config (top-level botToken, no bots list) stays bit-compatible.
+    const entry = {};
+    for (const [field, normalize] of Object.entries(BOT_ITEM_FIELDS)) {
+      entry[field] = field === 'token'
+        ? (typeof top.botToken === 'string' ? top.botToken : '')
+        : normalize(top[field]);
+    }
+    entry.id = 'default';
+    entry.botToken = entry.token; // alias, kept in sync
+    return [entry];
+  };
+  if (raw === undefined || raw === null) return singleFallback();
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return singleFallback();
+  } else if (typeof raw === 'object') {
+    // YAML coerced an empty list into {}: treat it as the empty list.
+    if (Object.keys(raw).length === 0) return singleFallback();
+    throw new Error('`bots` must be an array of bot entries, got a non-empty object');
+  } else {
+    throw new Error('`bots` must be an array, got ' + typeof raw);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    const entry = validateBotItem(item);
+    // Per-field fallback: an item field left unset (undefined) inherits the
+    // top-level value of the same field. `token` falls back to top.botToken
+    // (the legacy field name).
+    for (const field of Object.keys(BOT_ITEM_FIELDS)) {
+      if (entry[field] === undefined) {
+        entry[field] = field === 'token'
+          ? (typeof top.botToken === 'string' ? top.botToken : '')
+          : field === 'botToken'
+            ? (entry.token ?? '')
+            : BOT_ITEM_FIELDS[field](top[field]);
+      }
+    }
+    // Keep `botToken` in sync with the canonical `token` (either name is
+    // accepted on an item; downstream code may read either).
+    entry.botToken = entry.botToken || entry.token;
+    // id: item.id || (token ? 'bot-<first8>' : 'default')
+    entry.id = entry.id || (entry.token ? 'bot-' + String(entry.token).slice(0, 8) : 'default');
+    if (seen.has(entry.id)) {
+      throw new Error('duplicate bot id "' + entry.id + '" in `bots` config');
+    }
+    seen.add(entry.id);
+    out.push(entry);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Bot registry (v0.5.x)
+//
+// Module-level so unit tests can observe the live registry (tests import
+// these exports directly — see test/multi-bot.test.mjs). apply() CLEARS it
+// on entry (a reload starts from a clean slate) and repopulates it as bots
+// come up.
+//
+//   botId -> { id, cfg, client, poller, me }
+//     cfg    normalized bot entry (from normalizeBots)
+//     client TelegramClient (null when the bot was skipped for a missing token)
+//     poller TelegramPoller (null when not started)
+//     me     getMe() result (undefined until fetched; null if the fetch failed)
+// ---------------------------------------------------------------------------
+
+export const botRegistry = new Map();
+// v0.5.x P6: board / indicator state is hoisted to module scope (and exported)
+// so tests can assert UNLOAD left no residue in the composite-key maps. The
+// maps are cleared at the top of every apply() run (mirroring botRegistry) so
+// a reload starts clean and never carries a previous run's boards/indicators.
+export const subagentBoards = new Map(); // k(botId, chatId) -> SubagentBoard
+export const activeIndicators = new Map(); // k(botId, chatId) -> ProgressIndicator
+// v0.5.x P5/P6: test-only access to the closure-scoped per-bot ownership +
+// board helpers. apply() overwrites these each run with THAT run's closures,
+// so a test that does one apply() then reads the hook observes that run's
+// chatAgents/rootAgentToChat/boardForChat. (Host code never reads this.)
+export const __testHooks = { rootAgentToChat: null, ownerOfChildSession: null, boardForChat: null, chatAgents: null };
+export function clientFor(botId) {
+  const entry = botRegistry.get(botId);
+  if (!entry || !entry.client) {
+    throw new Error('clientFor: no Telegram client for bot id "' + botId + '" (unknown bot, or bot skipped for a missing token)');
+  }
+  return entry.client;
+}
+export function meFor(botId) {
+  const entry = botRegistry.get(botId);
+  if (!entry || !entry.me) {
+    throw new Error('meFor: no getMe() result for bot id "' + botId + '" (unknown bot, bot not started, or getMe() failed)');
+  }
+  return entry.me;
+}
+// Composite key: the ONLY place a "botId::chatId" key is built.
+export function k(botId, chatId) {
+  return botId + '::' + chatId;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
 export async function apply(ctx, config) {
   const c = Object.assign({}, defaults, config);
+  // Multi-bot (v0.5.x): normalize the `bots` list (or fall back to the
+  // legacy single-bot top-level config). A reload starts from a clean
+  // registry — any stale entries from a previous apply() are cleared.
+  const bots = normalizeBots(c.bots, c);
+  // A reload (apply re-run in the same process) starts from a clean registry —
+  // the unload cleanup iterates this map, so a stale entry would be a dead
+  // poller/client reference. Clear the board/indicator maps too (module scope,
+  // P6) so a previous run's boards/indicators never linger across a reload.
+  botRegistry.clear();
+  subagentBoards.clear();
+  activeIndicators.clear();
+
+  // v0.5.x P4 (tool layer): the optional `bot` parameter every send/media/edit/
+  // delete tool accepts (a bot id string). Resolution order:
+  //   (1) explicit `bot` — must be a known, connected bot id, else a CLEAR
+  //       tool error (never a throw/crash — matches the existing tool
+  //       error-return style);
+  //   (2) the owning bot of the target chat (composite-key reverse lookup via
+  //       botIdForChat, which falls back to 'default' for the legacy config);
+  //   (3) the legacy first-bot client (bit-compatible single-bot fallback).
+  // Returns { botId, client, error } — exactly one of client/error is non-null.
+  // NOTE: `client` / `clientFor` / `botIdForChat` are all in the same apply()
+  // scope (declared below); resolveBotClient only runs at tool-execute time,
+  // after they are initialized, so the closures are safe.
+  function resolveBotClient(botArg, chatId) {
+    if (botArg !== undefined && botArg !== null && String(botArg) !== '') {
+      const bid = String(botArg);
+      const entry = botRegistry.get(bid);
+      if (!entry) {
+        const known = [...botRegistry.keys()].join(', ') || '(none)';
+        return { botId: null, client: null, error: `Unknown bot id "${bid}". Known bots: ${known}.` };
+      }
+      if (!entry.client) return { botId: null, client: null, error: `Bot "${bid}" is not connected (no token configured).` };
+      return { botId: bid, client: entry.client, error: null };
+    }
+    const bid = botIdForChat(chatId);
+    const entry = botRegistry.get(bid);
+    if (entry && entry.client) return { botId: bid, client: entry.client, error: null };
+    // No owning bot for this chat (e.g. a chat never routed through a bot
+    // poller): fall back to the first/legacy client. Report its OWN id so
+    // clientFor(botId) can resolve the exact entry we are returning.
+    if (client) return { botId: firstBotId || 'default', client, error: null };
+    return { botId: null, client: null, error: 'No connected Telegram bot is configured.' };
+  }
+
+  // The bot of the card currently being handled (set by the onCallbackQuery
+  // wrapper, which knows the source bot). Default until set, so a stray
+  // pre-context call falls back to the default bot. Hoisted here (above the
+  // approval store) so the store's per-bot defaultChatId resolver can read it.
+  let activeCardBotId = 'default';
+
+  // v0.5.x P4: the telegram_get_updates tool advances a MANUAL poll offset that
+  // is INDEPENDENT PER BOT (keyed by bot id) and independent of the background
+  // poller's own offset. So consuming updates via one bot's manual poll never
+  // affects another bot's offset. (Each bot has its own Telegram offset stream
+  // anyway — per-bot is the only correct model.)
+  const updatesOffsetByBot = new Map(); // botId -> last update_id the tool read
+
   const botToken = await resolveBotToken(c.botToken || '', ctx);
   const baseUrl = c.baseUrl || process.env.TELEGRAM_BASE_URL || '';
   const allowedChats = c.allowedChats || [];
@@ -875,8 +1133,20 @@ export async function apply(ctx, config) {
           process.env.DSH_HOME || join(process.env.HOME || process.env.USERPROFILE || '', '.dsh'),
           'telegram-approval-always.json',
         );
+  // v0.5.x P5.1: the store's defaultChatId fallback is resolved PER BOT at the
+  // moment a rule is remembered (the source card's bot), NOT frozen to the
+  // top-level value at store creation. For the legacy single-bot config
+  // activeCardBotId stays 'default', whose cfg.defaultChatId IS the top-level
+  // defaultChatId — so single-bot behavior is bit-identical.
   const approvalStore = approvalEnabled
-    ? createAllowlistStore({ log, filePath: () => approvalStorePath, defaultChatId: String(defaultChatId || '') })
+    ? createAllowlistStore({
+        log,
+        filePath: () => approvalStorePath,
+        defaultChatId: () => {
+          const cfg = botRegistry.get(activeCardBotId || 'default')?.cfg;
+          return String(cfg?.defaultChatId || defaultChatId || '');
+        },
+      })
     : null;
 
   // Progress indicator options (tool calls + thinking), shared by both
@@ -953,24 +1223,83 @@ export async function apply(ctx, config) {
     injectedIds.add(id);
   }
 
-  // Initialize client if botToken is provided
-  if (botToken) {
-    client = new TelegramClient({
-      botToken,
-      baseUrl: baseUrl || undefined,
-      allowedChats: allowedChats.length ? allowedChats : undefined,
-      allowedUsers: allowedUsers.length ? allowedUsers : undefined,
-      requireMention,
-      longPollTimeout,
-    });
+  // The id of the FIRST bot with a client — `client` is that bot's client
+  // (legacy single-bot closures keep pointing here). For the legacy config it
+  // is 'default'. Per-bot message routing uses this as the "main" bot id.
+  let firstBotId = null;
 
-    client.getMe()
-      .then((me) => {
-        log('info', `Telegram bot initialized: @${me.username} (ID: ${me.id})`);
-      })
-      .catch((err) => {
-        log('error', `Failed to get bot info:`, err.message);
-      });
+  // Initialize clients (v0.5.x multi-bot loop). For each bot in the
+  // normalized `bots` list: resolve its token (plain > env[envKey] >
+  // credential[credentialKey]), and, ONLY when a token resolves, build a
+  // TelegramClient + register it in botRegistry. A bot whose token resolves
+  // to EMPTY (no plain token, no env var, no credential) is SKIPPED with a
+  // warn log — it never throws. When ALL bots are skipped the plugin runs in
+  // tools-only mode (tools still register; their `!client` guards throw a
+  // helpful error when called). This preserves the legacy "missing token
+  // degrades to tools-only" semantics exactly.
+  for (const botCfg of bots) {
+    // Per-bot token resolution: plain token > process.env[envKey] >
+    // credential[credentialKey]. (resolveBotToken handles the env+plain
+    // levels; the credential key is honored separately so each bot can use
+    // a distinct credential entry.)
+    const resolvedToken = (async () => {
+      const fromEnv = await resolveBotToken(botCfg.token, ctx, botCfg.envKey);
+      if (fromEnv) return fromEnv;
+      // Plain+env both empty -> try this bot's credential key (only when it
+      // differs from the env key, else resolveBotToken already tried it).
+      const credKey = botCfg.credentialKey || botCfg.envKey || 'TELEGRAM_BOT_TOKEN';
+      if (credKey === (botCfg.envKey || 'TELEGRAM_BOT_TOKEN')) return '';
+      for (const svc of [ctx.credentials, ctx.get?.('credentials')]) {
+        if (!svc || typeof svc.resolve !== 'function') continue;
+        try {
+          const value = isUsableCredential(await svc.resolve(credKey));
+          if (value) return value;
+        } catch {
+          // source not configured or unreadable; continue
+        }
+      }
+      return '';
+    })();
+    const token = await resolvedToken;
+    if (!token) {
+      log('warn', `bot "${botCfg.id}" has no token (config/env/credential all empty) — skipping; plugin runs tools-only for this bot.`);
+      // Register the entry WITHOUT a client so meFor()/clientFor() can report
+      // a precise "skipped" error, and the unload loop sees a consistent entry.
+      botRegistry.set(botCfg.id, { id: botCfg.id, cfg: botCfg, client: null, poller: null, me: null });
+      continue;
+    }
+    const base = botCfg.baseUrl || baseUrl || undefined;
+    const aChats = Array.isArray(botCfg.allowedChats) ? botCfg.allowedChats : allowedChats;
+    const aUsers = Array.isArray(botCfg.allowedUsers) ? botCfg.allowedUsers : allowedUsers;
+    const mention = botCfg.requireMention !== undefined ? botCfg.requireMention : requireMention;
+    const lpt = Number(botCfg.longPollTimeout) > 0 ? Number(botCfg.longPollTimeout) : longPollTimeout;
+    const entry = { id: botCfg.id, cfg: botCfg, client: null, poller: null, me: undefined };
+    entry.client = new TelegramClient({
+      botToken: token,
+      baseUrl: base,
+      allowedChats: aChats && aChats.length ? aChats : undefined,
+      allowedUsers: aUsers && aUsers.length ? aUsers : undefined,
+      requireMention: mention,
+      longPollTimeout: lpt,
+    });
+    // Keep the legacy single-bot closures (client/allowedChats/defaultChatId/
+    // ...) pointing at the FIRST bot with a client — tools + single-bot path
+    // are behaviorally unchanged for the legacy config.
+    if (!client) {
+      client = entry.client;
+      firstBotId = botCfg.id;
+    }
+    // Await getMe() here (not fire-and-forget): the polling block below needs
+    // entry.me synchronously for per-bot requireMention / meFor() lookups.
+    try {
+      const me = await entry.client.getMe();
+      entry.me = me;
+      log('info', `Telegram bot "${botCfg.id}" initialized: @${me.username} (ID: ${me.id})`);
+    } catch (err) {
+      entry.me = null;
+      log('error', `Failed to get bot info for "${botCfg.id}":`, err.message);
+    }
+    botRegistry.set(botCfg.id, entry);
   }
 
   // -----------------------------------------------------------------------
@@ -1053,7 +1382,8 @@ export async function apply(ctx, config) {
    * recognized/quoted text cannot trip Telegram's entity parser. Returns the
    * list of sent message ids (or [] on failure — callers treat as best-effort).
    */
-  async function sendPlainText(chatId, text, opts = {}) {
+  async function sendPlainText(botId, chatId, text, opts = {}) {
+    const tgClient = clientFor(botId);
     if (!text) return [];
     const sent = [];
     for (const chunk of chunkText(text, maxMessageLength)) {
@@ -1069,7 +1399,7 @@ export async function apply(ctx, config) {
       // critical agent-reply path — keep it light).
       let result;
       for (let attempt = 1; ; attempt++) {
-        try { result = await client.sendMessage(body); break; }
+        try { result = await tgClient.sendMessage(body); break; }
         catch (err) {
           if (attempt >= 2 || !isTransientTelegramError(err)) {
             log('warn', `sendPlainText to chat ${chatId} failed: ${err.message}`);
@@ -1127,7 +1457,13 @@ export async function apply(ctx, config) {
   // with parse_mode=HTML (no markdown conversion / escaping). Intended for
   // short, plugin-authored messages (command replies); chunking is naive for
   // HTML so keep such messages well under maxMessageLength.
-  async function sendText(chatId, rawText, opts) {
+  //
+  // `botId` (v0.5.x P2): selects the Telegram client to deliver on via
+  // clientFor(). The legacy single-bot config uses botId 'default', whose
+  // client is the first (only) bot — behavior unchanged. Tools that carry no
+  // per-bot context pass 'default' (the tool-level default bot).
+  async function sendText(botId, chatId, rawText, opts) {
+    const tgClient = clientFor(botId);
     // opts.plain: send with NO parse_mode (verbatim text). Used by the
     // subagent board whose lines may contain raw `<`/`>` from tool args —
     // sending as plain avoids Telegram "bad entities" errors.
@@ -1162,7 +1498,7 @@ export async function apply(ctx, config) {
       let result;
       for (let attempt = 1; ; attempt++) {
         try {
-          result = await client.sendMessage(body);
+          result = await tgClient.sendMessage(body);
           break;
         } catch (err) {
           if (attempt >= maxAttempts || !isTransientTelegramError(err)) {
@@ -1199,7 +1535,7 @@ export async function apply(ctx, config) {
   // Telegram ourselves. We poll until the agent is idle AND has produced an
   // assistant message after the injection point, which avoids relying on the
   // exact timing semantics of agent.whenIdle() for work queued just before.
-  async function watchDirectReply(agent, chatId, telegramMessageId) {
+  async function watchDirectReply(agent, botId, chatId, telegramMessageId) {
     try {
       const session = agent.session;
       const baseline = session && Array.isArray(session.events) ? session.events.length : 0;
@@ -1240,11 +1576,11 @@ export async function apply(ctx, config) {
         // Surface a turn failure (provider error, etc.) instead of staying
         // silent — a silent drop is exactly what made the schema-400 bug
         // invisible on the phone.
-        const notified = await notifyTurnFailure(agent, chatId, baseline, { replyToMessageId: telegramMessageId });
+        const notified = await notifyTurnFailure(agent, botId, chatId, baseline, { replyToMessageId: telegramMessageId });
         if (!notified) {
           log('warn', `Direct mode: no forwardable reply for chat ${chatId} (${gaveUpIdle ? 'agent idle without a fresh assistant message' : 'hit directReplyTimeoutSec cap'})`);
           try {
-            await sendText(String(chatId), `⚠️ 本次没有生成回复（${gaveUpIdle ? 'agent 空闲但无新回复' : '等待超时'}）。可重试，或到 Web 端查看。`, { replyToMessageId: telegramMessageId });
+            await sendText(botId, String(chatId), `⚠️ 本次没有生成回复（${gaveUpIdle ? 'agent 空闲但无新回复' : '等待超时'}）。可重试，或到 Web 端查看。`, { replyToMessageId: telegramMessageId });
           } catch (e) { log('error', 'Failed to send no-reply notice:', e.message); }
         }
         return;
@@ -1267,7 +1603,7 @@ export async function apply(ctx, config) {
 
       // 3) Deliver it.
       const prefixed = replyPrefix ? `${replyPrefix}\n${replyText}` : replyText;
-      await sendText(String(chatId), prefixed, { replyToMessageId: telegramMessageId });
+      await sendText(botId, String(chatId), prefixed, { replyToMessageId: telegramMessageId });
       log('info', `Direct reply sent to Telegram chat ${chatId}`);
     } catch (err) {
       log('error', 'Direct-mode reply failed:', err.message);
@@ -1298,14 +1634,14 @@ export async function apply(ctx, config) {
 
   // Send a concise "turn failed" notice to a Telegram chat. Best-effort: returns
   // true when a notice was sent, false otherwise (no turn error found / send failed).
-  async function notifyTurnFailure(agent, chatId, baseline, opts = {}) {
+  async function notifyTurnFailure(agent, botId, chatId, baseline, opts = {}) {
     try {
       const err = findTurnError(agent?.session?.events, baseline);
       if (!err) return false;
       const brief = String(err.message || err.code || 'unknown error').replace(/\s+/g, ' ').slice(0, 400);
       const codeLine = err.code ? `\n<code>${escapeHtml(err.code)}</code>` : '';
       log('error', `Turn ended with error for chat ${chatId}: ${err.message || err.code}`);
-      await sendText(String(chatId), `⚠️ 处理失败，未生成回复。${codeLine}\n${escapeHtml(brief)}`, {
+      await sendText(botId, String(chatId), `⚠️ 处理失败，未生成回复。${codeLine}\n${escapeHtml(brief)}`, {
         replyToMessageId: opts.replyToMessageId,
         messageThreadId: opts.messageThreadId,
       });
@@ -1330,7 +1666,8 @@ export async function apply(ctx, config) {
   // nothing useful (empty reply / no placeholder / send failed) so the indicator
   // cleans the placeholder up.
   // -----------------------------------------------------------------------
-  async function finalizeStreamingReply(chatId, rawText, opts = {}) {
+  async function finalizeStreamingReply(botId, chatId, rawText, opts = {}) {
+    const tgClient = clientFor(botId);
     const { placeholderMessageId, messageThreadId } = opts;
     const prefixed = replyPrefix ? `${replyPrefix}\n${rawText}` : rawText;
     if (!prefixed.trim()) return false;
@@ -1342,7 +1679,7 @@ export async function apply(ctx, config) {
       const guarded = guardConvertedLength(prefixed, markdownToTelegramHtml(prefixed), 4096);
       if (guarded.useParseMode) {
         try {
-          const ok = await client.editMessageText(chatId, placeholderMessageId, guarded.text, 'HTML');
+          const ok = await tgClient.editMessageText(chatId, placeholderMessageId, guarded.text, 'HTML');
           if (ok) {
             log('info', `Streaming reply finalized in place for chat ${chatId}`);
             return true;
@@ -1352,12 +1689,12 @@ export async function apply(ctx, config) {
         }
       }
       // Overflow / edit failure: remove the placeholder so it doesn't linger.
-      try { await client.deleteMessage(chatId, placeholderMessageId); } catch { /* ignore */ }
+      try { await tgClient.deleteMessage(chatId, placeholderMessageId); } catch { /* ignore */ }
     }
 
     // Fallback: normal (chunked) delivery, replying into the same thread.
     try {
-      await sendText(String(chatId), prefixed, { messageThreadId });
+      await sendText(botId, String(chatId), prefixed, { messageThreadId });
       log('info', `Streaming reply sent (chunked) for chat ${chatId}`);
       return true;
     } catch (err) {
@@ -1404,7 +1741,8 @@ export async function apply(ctx, config) {
    * block) describing it for the agent. Always returns { note, imageBlock }.
    * Best-effort: never throws — a download failure becomes a descriptive note.
    */
-  async function downloadAndDescribeInboundMedia(message) {
+  async function downloadAndDescribeInboundMedia(botId, message) {
+    const tgClient = clientFor(botId);
     const kind = inboundMediaKind(message);
     const fileId = inboundMediaFileId(message);
     if (!fileId) {
@@ -1412,7 +1750,7 @@ export async function apply(ctx, config) {
     }
     let dl;
     try {
-      dl = await client.downloadFile(fileId, inboundMediaDir);
+      dl = await tgClient.downloadFile(fileId, inboundMediaDir);
     } catch (err) {
       log('warn', `Inbound ${kind} download failed: ${err.message}`);
       return { note: `(the user sent a ${kind} but it could not be downloaded: ${err.message})`, imageBlock: null, localPath: null };
@@ -1467,15 +1805,72 @@ export async function apply(ctx, config) {
   }
 
   // -----------------------------------------------------------------------
+  // Per-bot client dispatch (v0.5.x P2/P3). The approval + ask_user_question
+  // modules are pure factories that hold ONE client object (their `client`
+  // dep) — we keep that contract (so their unit tests keep passing) but make
+  // that object dispatch to the CORRECT bot client by resolving the owning
+  // bot from the (now composite-keyed) chatAgents map.
+  //
+  // Resolution order for each call: (a) explicit `botId` in the args, else
+  // (b) a `chatId` in the args (sendMessage({chatId}) / editMessageText
+  // (chatId, ...) / pin/unpin/sendChatAction), else (c) the active-card bot
+  // context (set by the index's onCallbackQuery wrapper before calling the
+  // module's handleCallbackQuery — needed for answerCallbackQuery(qid, toast),
+  // which carries no chatId), else (d) 'default'.
+  // -----------------------------------------------------------------------
+  // The bot id that owns a given chatId (the part of the composite key
+  // k(botId, chatId) before '::'); 'default' when no (bot, chat) route exists.
+  function botIdForChat(chatId) {
+    const cid = String(chatId ?? '');
+    for (const key of chatAgents.keys()) {
+      const bi = key.indexOf('::');
+      if (bi >= 0 && key.slice(bi + 2) === cid) return key.slice(0, bi);
+    }
+    return 'default';
+  }
+  // (activeCardBotId is declared earlier in apply(), above the approval store,
+  // so the store's per-bot defaultChatId resolver can read it.)
+  // Set the active-card bot context. Called by the index onCallbackQuery
+  // wrapper (botId known there) before invoking the module handlers.
+  const setActiveCardBotId = (b) => { activeCardBotId = b || 'default'; };
+  // Client-shaped object handed to the approval/question modules as their
+  // `client`/`activeClient` dep. Every method dispatch to the correct bot
+  // client per the resolution order above. For the legacy single-bot config
+  // every call resolves to the default bot — identical to the old single
+  // client object, so the modules' plain-client unit tests keep passing.
+  const clientDispatch = new Proxy({}, {
+    get(_t, prop) {
+      if (typeof prop === 'symbol') return undefined;
+      return (...args) => {
+        let bid = null;
+        for (const a of args) {
+          if (a && typeof a === 'object' && !Array.isArray(a)) {
+            if (a.botId != null) bid = String(a.botId);
+            else if (a.chatId != null && !bid) bid = botIdForChat(a.chatId);
+          }
+        }
+        // Positional args: first string/number that is a chatId (edit/pin/
+        // unpin/sendChatAction all lead with chatId).
+        if (!bid) {
+          for (const a of args) {
+            if (typeof a === 'string' || typeof a === 'number') { bid = botIdForChat(a); break; }
+          }
+        }
+        return clientFor(bid || activeCardBotId || 'default')[prop](...args);
+      };
+    },
+  });
+
+  // -----------------------------------------------------------------------
   // Progress indicator wiring (module-scope class + helpers above). A chat has
   // at most one indicator at a time — the plugin routes each chat to a single
   // active agent, so we key by chatId.
+  // (activeIndicators is module-scope, P6: exported + cleared per apply().)
   // -----------------------------------------------------------------------
-  const activeIndicators = new Map(); // chatId (string) -> ProgressIndicator
 
-  function startProgressForAgent(agent, chatId, baseline, threadId) {
+  function startProgressForAgent(agent, botId, chatId, baseline, threadId) {
     if (!progressEnabled) return;
-    const chatKey = String(chatId);
+    const chatKey = k(botId, chatId);
     const prev = activeIndicators.get(chatKey);
     if (prev) {
       // A previous turn's indicator is still alive (e.g. user re-sent while
@@ -1493,7 +1888,7 @@ export async function apply(ctx, config) {
       agent,
       baseline,
       startedAt: Date.now(),
-      client,
+      client: clientFor(botId),
       log,
       delayMs: progressDelayMs,
       tickMs: progressTickMs,
@@ -1502,8 +1897,8 @@ export async function apply(ctx, config) {
       maxChars: progressMaxChars,
       timeoutMs: progressTimeoutMs,
       streaming,
-      onFinalReply: streaming ? (cid, text, o) => finalizeStreamingReply(cid, text, o) : undefined,
-      onTurnError: streaming ? (cid, o) => notifyTurnFailure(agent, cid, baseline, { messageThreadId: o.messageThreadId }) : undefined,
+      onFinalReply: streaming ? (cid, text, o) => finalizeStreamingReply(botId, cid, text, o) : undefined,
+      onTurnError: streaming ? (cid, o) => notifyTurnFailure(agent, botId, cid, baseline, { messageThreadId: o.messageThreadId }) : undefined,
     });
     activeIndicators.set(chatKey, ind);
     ind.start();
@@ -1519,12 +1914,18 @@ export async function apply(ctx, config) {
     description: `Send a message to a Telegram chat. Supports text, HTML formatting, and automatic message splitting for long content.
 
 The bot must have access to the target chat. For group chats, the bot must be a member.
-Markdown in the text will be converted to Telegram HTML format automatically (when parse_mode is HTML, the default).`,
+Markdown in the text will be converted to Telegram HTML format automatically (when parse_mode is HTML, the default).
+
+With multiple bots configured, pass the "bot" parameter to choose which bot sends (default: the bot that owns the chat, or the default/first bot).`,
 
     parameters: {
       chat_id: {
         type: 'string',
         description: 'Telegram chat ID (numeric or @username). Falls back to config defaultChatId if empty.',
+      },
+      bot: {
+        type: 'string',
+        description: 'Which bot sends this message (a bot id). Default: the bot that owns the chat, or the default/first bot when there is only one.',
       },
       text: {
         type: 'string',
@@ -1551,17 +1952,17 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured. Set botToken in plugin config or TELEGRAM_BOT_TOKEN environment variable (or DSH credentials).');
-      }
-
       const chatId = args.chat_id || defaultChatId;
       if (!chatId) {
         throw new Error('chat_id is required and no defaultChatId is configured.');
       }
+      const { botId, error } = resolveBotClient(args.bot, chatId);
+      if (error) return error;
 
       const text = args.text || '';
-      const sent = await sendText(chatId, text, {
+      // v0.5.x P4: explicit `bot` wins; else the bot that OWNS this chat
+      // (composite-key lookup); 'default' for a legacy single-bot config.
+      const sent = await sendText(botId, chatId, text, {
         parseMode: args.parse_mode,
         replyToMessageId: args.reply_to_message_id,
         messageThreadId: args.message_thread_id,
@@ -1580,12 +1981,16 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_send_photo',
-    description: 'Send a photo to a Telegram chat. The photo parameter can be a Telegram file_id (previously uploaded), a public URL, or an absolute local file path (uploaded via multipart).',
+    description: 'Send a photo to a Telegram chat. The photo parameter can be a Telegram file_id (previously uploaded), a public URL, or an absolute local file path (uploaded via multipart). With multiple bots configured, pass `bot` to choose which bot sends.',
 
     parameters: {
       chat_id: {
         type: 'string',
         description: 'Target Telegram chat ID.',
+      },
+      bot: {
+        type: 'string',
+        description: 'Which bot sends this photo (a bot id). Default: the bot that owns the chat, or the default/first bot.',
       },
       photo: {
         type: 'string',
@@ -1608,14 +2013,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
-      }
-
       const chatId = args.chat_id || defaultChatId;
       if (!chatId) {
         throw new Error('chat_id is required.');
       }
+      const { client: sendClient, error } = resolveBotClient(args.bot, chatId);
+      if (error) return error;
 
       let caption;
       let captionParseMode = args.parse_mode || parseMode;
@@ -1629,7 +2032,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         }
       }
 
-      const result = await client.sendPhoto({
+      const result = await sendClient.sendPhoto({
         chatId,
         photo: args.photo,
         caption,
@@ -1648,12 +2051,16 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_send_document',
-    description: 'Send a document (file) to a Telegram chat. The document parameter can be a Telegram file_id or a public URL.',
+    description: 'Send a document (file) to a Telegram chat. The document parameter can be a Telegram file_id or a public URL. With multiple bots configured, pass `bot` to choose which bot sends.',
 
     parameters: {
       chat_id: {
         type: 'string',
         description: 'Target Telegram chat ID.',
+      },
+      bot: {
+        type: 'string',
+        description: 'Which bot sends this document (a bot id). Default: the bot that owns the chat, or the default/first bot.',
       },
       document: {
         type: 'string',
@@ -1676,14 +2083,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
-      }
-
       const chatId = args.chat_id || defaultChatId;
       if (!chatId) {
         throw new Error('chat_id is required.');
       }
+      const { client: sendClient, error } = resolveBotClient(args.bot, chatId);
+      if (error) return error;
 
       let caption;
       let captionParseMode = args.parse_mode || parseMode;
@@ -1697,7 +2102,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         }
       }
 
-      const result = await client.sendDocument({
+      const result = await sendClient.sendDocument({
         chatId,
         document: args.document,
         caption,
@@ -1716,12 +2121,16 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_send_video',
-    description: 'Send a video to a Telegram chat. The video parameter can be a Telegram file_id (previously uploaded) or a public URL.',
+    description: 'Send a video to a Telegram chat. The video parameter can be a Telegram file_id (previously uploaded) or a public URL. With multiple bots configured, pass `bot` to choose which bot sends.',
 
     parameters: {
       chat_id: {
         type: 'string',
         description: 'Target Telegram chat ID.',
+      },
+      bot: {
+        type: 'string',
+        description: 'Which bot sends this video (a bot id). Default: the bot that owns the chat, or the default/first bot.',
       },
       video: {
         type: 'string',
@@ -1744,13 +2153,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
-      }
       const chatId = args.chat_id || defaultChatId;
       if (!chatId) {
         throw new Error('chat_id is required.');
       }
+      const { client: sendClient, error } = resolveBotClient(args.bot, chatId);
+      if (error) return error;
 
       let caption;
       let captionParseMode = args.parse_mode || parseMode;
@@ -1764,7 +2172,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         }
       }
 
-      const result = await client.sendVideo({
+      const result = await sendClient.sendVideo({
         chatId,
         video: args.video,
         caption,
@@ -1783,12 +2191,16 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_send_audio',
-    description: 'Send an audio file (music, podcast, etc.) to a Telegram chat. The audio parameter can be a Telegram file_id, a public URL, or an absolute local file path (uploaded via multipart).',
+    description: 'Send an audio file (music, podcast, etc.) to a Telegram chat. The audio parameter can be a Telegram file_id, a public URL, or an absolute local file path (uploaded via multipart). With multiple bots configured, pass `bot` to choose which bot sends.',
 
     parameters: {
       chat_id: {
         type: 'string',
         description: 'Target Telegram chat ID.',
+      },
+      bot: {
+        type: 'string',
+        description: 'Which bot sends this audio (a bot id). Default: the bot that owns the chat, or the default/first bot.',
       },
       audio: {
         type: 'string',
@@ -1823,13 +2235,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
-      }
       const chatId = args.chat_id || defaultChatId;
       if (!chatId) {
         throw new Error('chat_id is required.');
       }
+      const { client: sendClient, error } = resolveBotClient(args.bot, chatId);
+      if (error) return error;
 
       let caption;
       let captionParseMode = args.parse_mode || parseMode;
@@ -1843,7 +2254,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         }
       }
 
-      const result = await client.sendAudio({
+      const result = await sendClient.sendAudio({
         chatId,
         audio: args.audio,
         caption,
@@ -1880,6 +2291,10 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         type: 'string',
         description: 'Target Telegram chat ID. Defaults to the configured default chat.',
       },
+      bot: {
+        type: 'string',
+        description: 'Which bot sends this voice message (a bot id). Default: the bot that owns the chat, or the default/first bot.',
+      },
       text: {
         type: 'string',
         required: true,
@@ -1896,13 +2311,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
-      }
       const chatId = args.chat_id || defaultChatId;
       if (!chatId) {
         throw new Error('chat_id is required.');
       }
+      const { client: sendClient, error } = resolveBotClient(args.bot, chatId);
+      if (error) return error;
       if (!args.text || !String(args.text).trim()) {
         throw new Error('text is required for voice synthesis.');
       }
@@ -1931,7 +2345,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         writeFileSync(wavPath, buf);
 
         const { oggPath, duration } = await wavToOgg(wavPath, workDir, exec?.signal);
-        const result = await client.sendVoiceFile({
+        const result = await sendClient.sendVoiceFile({
           chatId,
           filePath: oggPath,
           duration,
@@ -1951,13 +2365,17 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_edit_message',
-    description: 'Edit an existing Telegram message. The bot can only edit its own messages.',
+    description: 'Edit an existing Telegram message. The bot can only edit its own messages. With multiple bots configured, pass `bot` to choose which bot edits.',
 
     parameters: {
       chat_id: {
         type: 'string',
         required: true,
         description: 'Chat ID where the message is.',
+      },
+      bot: {
+        type: 'string',
+        description: 'Which bot performs the edit (a bot id). Default: the bot that owns the chat, or the default/first bot.',
       },
       message_id: {
         type: 'integer',
@@ -1977,9 +2395,8 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
-      }
+      const { client: sendClient, error } = resolveBotClient(args.bot, args.chat_id);
+      if (error) return error;
 
       let text;
       let pMode = args.parse_mode || parseMode;
@@ -1991,7 +2408,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         text = args.text;
       }
 
-      const success = await client.editMessageText(args.chat_id, args.message_id, text, pMode, exec?.signal);
+      const success = await sendClient.editMessageText(args.chat_id, args.message_id, text, pMode, exec?.signal);
       if (success) {
         return `Message ${args.message_id} edited successfully.`;
       }
@@ -2005,13 +2422,17 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_delete_message',
-    description: 'Delete a Telegram message. The bot can delete its own messages and, if it has admin rights, other messages too.',
+    description: 'Delete a Telegram message. The bot can delete its own messages and, if it has admin rights, other messages too. With multiple bots configured, pass `bot` to choose which bot deletes.',
 
     parameters: {
       chat_id: {
         type: 'string',
         required: true,
         description: 'Chat ID where the message is.',
+      },
+      bot: {
+        type: 'string',
+        description: 'Which bot performs the delete (a bot id). Default: the bot that owns the chat, or the default/first bot.',
       },
       message_id: {
         type: 'integer',
@@ -2021,10 +2442,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
-      }
-      const success = await client.deleteMessage(args.chat_id, args.message_id, exec?.signal);
+      const { client: sendClient, error } = resolveBotClient(args.bot, args.chat_id);
+      if (error) return error;
+      const success = await sendClient.deleteMessage(args.chat_id, args.message_id, exec?.signal);
       if (success) {
         return `Message ${args.message_id} deleted successfully.`;
       }
@@ -2038,36 +2458,31 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   registerTool({
     name: 'telegram_get_info',
-    description: 'Get information about the Telegram bot (username, ID) and current configuration status.',
+    description: 'Get information about the configured Telegram bot(s) — a list, one entry per bot. Each entry: id (bot id from config, e.g. "default"), username (from getMe), botId (numeric Telegram user id from getMe), connected (has a live client), name, defaultChat.',
 
     parameters: {},
 
+    // v0.5.x P4: multi-bot — return ONE entry per registered bot (the registry
+    // is the single source of truth). A legacy single-bot config yields exactly
+    // one entry (id "default"), so single-bot callers still see one item. The
+    // host renders a non-string return as indented JSON, so returning a plain
+    // array is the intended contract (no JSON string round-trip).
     async execute() {
-      if (!client) {
-        throw new Error('Telegram bot is not configured. Set botToken in plugin config, TELEGRAM_BOT_TOKEN environment variable, or the DSH credentials service.');
+      const entries = [...botRegistry.values()];
+      if (entries.length === 0) {
+        throw new Error('No Telegram bot is configured. Set botToken in plugin config, TELEGRAM_BOT_TOKEN environment variable, or the DSH credentials service.');
       }
-
-      const me = await client.getMe();
-      return [
-        'Telegram Bot Info:',
-        `- ID: ${me.id}`,
-        `- Username: @${me.username}`,
-        `- Name: ${me.firstName}`,
-        '',
-        'Configuration:',
-        `- Polling: ${pollingEnabled ? 'enabled' : 'disabled'}`,
-        `- Default chat: ${defaultChatId || 'not set'}`,
-        `- Parse mode: ${parseMode}`,
-        `- Allowed chats: ${allowedChats.length ? allowedChats.join(', ') : 'all'}`,
-        `- Allowed users: ${allowedUsers.length ? allowedUsers.join(', ') : 'all'}`,
-        `- Require mention in groups: ${requireMention}`,
-        '',
-        'Agent Integration:',
-        `- Inject to agent: ${injectToAgent ? 'enabled' : 'disabled'}`,
-        `- Response mode: ${agentResponseMode}`,
-        `- Sessions service: ${ctx.get?.('sessions') ? 'yes' : 'no'}`,
-        `- Agents service: ${ctx.get?.('agents') ? 'yes' : 'no'}`,
-      ].join('\n');
+      return entries.map((entry) => {
+        const me = entry.me;
+        return {
+          id: entry.id,
+          username: me?.username ?? null,
+          botId: me ? Number(me.id) : null,
+          name: me?.firstName ?? null,
+          connected: Boolean(entry.client),
+          defaultChat: String(entry.cfg?.defaultChatId || defaultChatId || ''),
+        };
+      });
     },
   });
 
@@ -2080,9 +2495,13 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     description: 'Manually poll for new Telegram updates. Useful for checking recent messages without enabling continuous polling. NOTE: if the background poller is enabled, calling this tool will intermittently return a 409 conflict (Telegram only allows one active getUpdates consumer per bot).',
 
     parameters: {
+      bot: {
+        type: 'string',
+        description: 'Which bot to poll (a bot id). Default: the default/first bot. Each bot keeps its OWN manual offset, so polling one bot does not affect another.',
+      },
       offset: {
         type: 'integer',
-        description: 'Offset to start from (update_id). Skips already processed updates.',
+        description: 'Offset to start from (update_id). Skips already processed updates. When omitted, this bot\'s last manual-poll offset is used (independent per bot).',
       },
       limit: {
         type: 'integer',
@@ -2091,21 +2510,42 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     },
 
     async execute(args, exec) {
-      if (!client) {
-        throw new Error('Telegram bot is not configured.');
+      // v0.5.x P4: resolve the target bot (explicit `bot` wins, else the
+      // default/first bot). Each bot keeps its OWN manual poll offset so a
+      // manual poll on one bot never advances another bot's stream.
+      const botId = (args.bot !== undefined && args.bot !== null && String(args.bot) !== '')
+        ? String(args.bot)
+        : (botIdForChat(defaultChatId) || 'default');
+      const entry = botRegistry.get(botId);
+      if (!entry) {
+        const known = [...botRegistry.keys()].join(', ') || '(none)';
+        return `Unknown bot id "${botId}". Known bots: ${known}.`;
       }
+      if (!entry.client) {
+        return `Bot "${botId}" is not connected (no token configured).`;
+      }
+      const pollClient = entry.client;
 
-      const offset = args.offset;
+      // Per-bot manual offset: an explicit arg wins; otherwise the offset this
+      // bot already consumed in a prior manual poll; otherwise 0 (all avail.).
+      const explicitOffset = (args.offset !== undefined && args.offset !== null) ? Number(args.offset) : undefined;
+      const offset = explicitOffset !== undefined ? explicitOffset : (updatesOffsetByBot.get(botId) ?? 0);
       const limit = args.limit || 20;
       let updates;
       try {
-        updates = await client.getUpdates(offset, limit, 5, exec?.signal);
+        updates = await pollClient.getUpdates(offset, limit, 5, exec?.signal);
       } catch (err) {
         const text = String(err?.message || '') + ' ' + String(err?.details || '');
         if (/409/i.test(text) || /conflict/i.test(text) || /terminated by other/i.test(text)) {
-          throw new Error('getUpdates conflict (409): another poller is already consuming this bot. Stop the background poller (pollingEnabled: false) or wait for it to finish before using this tool.');
+          throw new Error(`getUpdates conflict (409) on bot "${botId}": another poller is already consuming this bot. Stop the background poller (pollingEnabled: false) or wait for it to finish before using this tool.`);
         }
         throw err;
+      }
+
+      // Advance this bot's manual offset past the highest update_id read.
+      if (updates.length > 0) {
+        const maxId = Math.max(...updates.map((u) => Number(u.updateId) || 0));
+        updatesOffsetByBot.set(botId, maxId + 1);
       }
 
       if (updates.length === 0) {
@@ -2159,8 +2599,25 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
   // Background polling service
   // -----------------------------------------------------------------------
 
+  // Per-chat active agent routing (Plan A) + owned agent handles.
+  //   chatAgents: k(botId, chatId) -> root agent sessionId. Declared at
+  //   function scope (not inside the `if (pollingEnabled && client)` block)
+  //   so the module-scope dispatch helpers (botIdForChat / clientDispatch,
+  //   which resolve the owning bot from this map) can see it even before the
+  //   poll block runs.
+  //   ownedHandles: agent handles created by /new etc., kept alive so they are
+  //   not disposed; cleaned up in the unload effect.
+  const chatAgents = new Map(); // k(botId, chatId) -> agent sessionId (string)
+  const ownedHandles = []; // AgentHandle[] kept so created agents are not disposed
+
   if (pollingEnabled && client) {
-    poller = new TelegramPoller(client, {
+    // Legacy closure binding: the FIRST bot with a client. For the legacy
+    // single-bot config this is the only bot, so every closure below
+    // (message handler, commands, approval, questions, progress) behaves
+    // EXACTLY as before. Per-bot wiring of callbacks/sendText is S2's work.
+    const activeClient = client;
+    let activePoller = null;
+    activePoller = new TelegramPoller(activeClient, {
       allowedChats: allowedChats.length ? allowedChats : undefined,
       allowedUsers: allowedUsers.length ? allowedUsers : undefined,
       requireMention,
@@ -2175,10 +2632,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     // Regular messages go to the chat's active agent (fallback: first agent).
     // Agents created here are owned by this plugin and kept alive via the
     // handles array (so the fiber's disposal bookkeeping tracks them).
-    const chatAgents = new Map(); // chatId (string) -> agent sessionId (string)
-    const ownedHandles = []; // AgentHandle[] kept so created agents are not disposed
+    // (chatAgents / ownedHandles are declared at function scope above.)
 
-    async function createTelegramAgent(chatId) {
+    async function createTelegramAgent(botId, chatId) {
       const agentsSvc = ctx.get?.('agents');
       if (!agentsSvc?.create) throw new Error('agents service unavailable');
       const sessionId = `telegram-${randomUUID()}`;
@@ -2226,6 +2682,10 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         sessionId,
         meta: {
           cwd,
+          // v0.5.x P2: which bot created this agent. Lets rootAgentToChat()
+          // resolve the per-bot defaultChat (and ownership) without hardcoding
+          // the top-level default.
+          botId,
           ...(presetId ? { agentPreset: presetId } : {}),
         },
         ...(agentOptions ? { agentOptions } : {}),
@@ -2235,10 +2695,10 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       return String(sessionId);
     }
 
-    function resolveChatAgent(chatId) {
+    function resolveChatAgent(botId, chatId) {
       const agentsSvc = ctx.get?.('agents');
       const all = agentsSvc?.list?.() ?? [];
-      const activeId = chatAgents.get(String(chatId));
+      const activeId = chatAgents.get(k(botId, chatId));
       if (activeId) {
         const hit = all.find((a) => String(a?.session?.id) === activeId);
         if (hit) return hit;
@@ -2263,35 +2723,53 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     // map (chatId -> root agent session id); it is in scope via closure, so the
     // board helpers read it directly.
     // ---------------------------------------------------------------------
-    const subagentBoards = new Map(); // chatId (string) -> SubagentBoard
+    // v0.5.x P2: keyed by k(botId, chatId) — one board per (bot, chat).
+    // (subagentBoards is module-scope, P6: exported + cleared per apply().)
 
     // Map each root (non-subagent) agent session id to the chat that owns it:
     // the chat routed to it via chatAgents, else the default chat for the
     // first (default) agent, else null.
+    // v0.5.x P2: root sid -> { chatId, botId } (the (bot, chat) that owns the
+    // root agent) or null. The composite key `k(botId, chatId)` carries BOTH
+    // the chat and the owning bot, so we can resolve both without hardcoding
+    // the top-level default. Fallback (agent not routed in chatAgents): the
+    // per-bot default chat from the agent's own meta.botId config — for the
+    // legacy single-bot config that is the top-level defaultChatId (unchanged).
     function rootAgentToChat() {
       const agentsSvc = ctx.get?.('agents');
       const all = agentsSvc?.list?.() ?? [];
-      const map = new Map();
-      const defaultChat = defaultChatId ? String(defaultChatId) : null;
+      const map = new Map(); // root sid -> { chatId, botId } | null
       for (let i = 0; i < all.length; i++) {
         const a = all[i];
         const sid = a?.session?.id != null ? String(a.session.id) : (a?.id != null ? String(a.id) : null);
         if (!sid || a?.session?.header?.origin === 'subagent') continue;
         let owner = null;
-        for (const [chatId, routed] of chatAgents) {
-          if (routed === sid) { owner = chatId; break; }
+        for (const [key, routed] of chatAgents) {
+          if (String(routed) === sid) {
+            const bi = key.indexOf('::');
+            owner = { chatId: bi >= 0 ? key.slice(bi + 2) : key, botId: bi >= 0 ? key.slice(0, bi) : 'default' };
+            break;
+          }
         }
-        if (!owner && i === 0) owner = defaultChat;
+        if (!owner) {
+          const agentBotId = a?.meta?.botId || (i === 0 ? 'default' : null);
+          const agentCfg = agentBotId ? botRegistry.get(agentBotId)?.cfg : null;
+          if (agentCfg?.defaultChatId) {
+            owner = { chatId: String(agentCfg.defaultChatId), botId: agentBotId || 'default' };
+          } else if (i === 0 && defaultChatId) {
+            owner = { chatId: String(defaultChatId), botId: 'default' };
+          }
+        }
         map.set(sid, owner);
       }
       return map;
     }
 
     // The agent a chat routes to (its active one, else the default/first).
-    function chatAgentOf(chatId) {
+    function chatAgentOf(botId, chatId) {
       const agentsSvc = ctx.get?.('agents');
       const all = agentsSvc?.list?.() ?? [];
-      const activeId = chatAgents.get(String(chatId));
+      const activeId = chatAgents.get(k(botId, chatId));
       if (activeId) {
         const hit = all.find((a) => String(a?.session?.id ?? a?.id) === activeId);
         if (hit) return hit;
@@ -2302,7 +2780,10 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     // Route a child (subagent) session back to the chat that owns it, by
     // following header.parentSession to a root agent and looking up that root
     // in the chat map. Returns chatId or null.
-    function chatOfChildSession(childSession) {
+    // v0.5.x P2: resolve the (botId, chatId) that owns a child session by
+    // following header.parentSession up to a root agent and looking that root
+    // up in rootAgentToChat(). Returns { chatId, botId } or null.
+    function ownerOfChildSession(childSession) {
       if (!childSession) return null;
       const root = rootAgentToChat();
       let cur = childSession;
@@ -2312,7 +2793,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         if (sid && seen.has(sid)) return null;
         if (sid) seen.add(sid);
         const owner = root.get(sid);
-        if (owner) return owner;
+        if (owner) return owner; // { chatId, botId }
         const parentId = cur?.header?.parentSession;
         if (parentId == null) {
           // Reached a root session that has no chat owner.
@@ -2326,15 +2807,15 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       return null;
     }
 
-    // True when a child belongs to this chat. Direct child = the parent is one
-    // of this chat's root agents; otherwise (descendants enabled) the parent
-    // chain resolves up to one of them.
-    function childBelongsToChat(childSession, chatId) {
+    // True when a child belongs to this (bot, chat). Direct child = the parent
+    // is one of this chat's root agents; otherwise (descendants enabled) the
+    // parent chain resolves up to one of them.
+    function childBelongsToChat(childSession, botId, chatId) {
       if (!childSession || childSession.header?.origin !== 'subagent') return false;
       const chatRoots = new Set();
       const agentsSvc = ctx.get?.('agents');
       const all = agentsSvc?.list?.() ?? [];
-      const activeId = chatAgents.get(String(chatId));
+      const activeId = chatAgents.get(k(botId, chatId));
       if (activeId) chatRoots.add(activeId);
       if (all[0] && all[0].session?.id != null) chatRoots.add(String(all[0].session.id));
       const targetRoot = (sid) => chatRoots.has(String(sid));
@@ -2359,18 +2840,25 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       return false;
     }
 
-    function boardForChat(chatId) {
-      const key = String(chatId);
+    // v0.5.x P2: one board per (bot, chat). The composite key k(botId, chatId)
+    // keeps boards for the same chatId under different bots separate, and the
+    // board's send/edit/pin bindings use the OWNING bot's client (not the
+    // first bot). board.chatId stores the raw chatId; the (bot, chat) identity
+    // lives in the map key.
+    function boardForChat(botId, chatId) {
+      const key = k(botId, chatId);
+      const cid = String(chatId);
       let b = subagentBoards.get(key);
       if (!b) {
+        const bClient = clientFor(botId);
         b = new SubagentBoard({
-          chatId: key,
+          chatId: cid,
           pinEnabled: subagentBoardPin,
           maxRows: subagentBoardMaxRows,
-          sendText: (text, opts) => sendText(key, text, { ...opts, plain: true }),
-          editText: (messageId, text) => client.editMessageText(key, messageId, text, undefined),
-          pin: (messageId) => client.pinChatMessage(key, messageId),
-          unpin: (messageId) => client.unpinChatMessage(key, messageId),
+          sendText: (text, opts) => sendText(botId, cid, text, { ...opts, plain: true }),
+          editText: (messageId, text) => bClient.editMessageText(cid, messageId, text, undefined),
+          pin: (messageId) => bClient.pinChatMessage(cid, messageId),
+          unpin: (messageId) => bClient.unpinChatMessage(cid, messageId),
           listAgents: () => (ctx.get?.('agents')?.list?.() ?? []),
           log: (level, ...args) => log(level, ...args),
         });
@@ -2387,9 +2875,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       const sid = childSession?.id != null ? String(childSession.id)
         : (agent?.id != null ? String(agent.id) : null);
       if (!sid) return null;
-      const chatId = chatOfChildSession(childSession);
-      if (!chatId || !childBelongsToChat(childSession, chatId)) return null;
-      const board = boardForChat(chatId);
+      const owner = ownerOfChildSession(childSession);
+      if (!owner || !childBelongsToChat(childSession, owner.botId, owner.chatId)) return null;
+      const board = boardForChat(owner.botId, owner.chatId);
       if (!board.entries.has(sid)) board.onStart({ id: sid });
       // If the child is no longer running, lock it (presence-based end).
       const e = board.entries.get(sid);
@@ -2418,11 +2906,14 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         // cheap, and it keeps the board correct even when no event fired.
         sweepSubagentsByPresence();
         // Drive live refresh + throttled flush for every active board.
-        for (const [chatId, board] of [...subagentBoards]) {
+        // key = k(botId, chatId); board.chatId holds the raw chatId.
+        for (const [key, board] of [...subagentBoards]) {
           board.prune(Date.now());
-          if (board.isEmpty) { subagentBoards.delete(chatId); continue; }
+          if (board.isEmpty) { subagentBoards.delete(key); continue; }
           if (board.hasWorking) {
-            const parentSession = chatAgentOf(board.chatId)?.session;
+            const bi = key.indexOf('::');
+            const boardBotId = bi >= 0 ? key.slice(0, bi) : 'default';
+            const parentSession = chatAgentOf(boardBotId, board.chatId)?.session;
             board.refresh(parentSession);
           }
           void board.flush();
@@ -2433,6 +2924,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     }
 
     function ensureBoardTicker() {
+      // Run the global board ticker whenever ANY bot has a client (the tick
+      // loop is per-(bot,chat) via the composite key; `client` is the first
+      // bot's client and is non-null iff at least one bot is up).
       if (!subagentBoardEnabled || !client || subagentBoardTicker) return;
       subagentBoardTicker = setInterval(() => tickBoards(), subagentBoardRefreshMs);
       try { if (typeof subagentBoardTicker.unref === 'function') subagentBoardTicker.unref(); } catch { /* ignore */ }
@@ -2455,10 +2949,14 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         const all = ctx.get?.('agents')?.list?.() ?? [];
         return all.find((a) => String(a?.session?.id ?? a?.id) === sid) ?? null;
       };
-      // A board that already tracks this child (by entry id).
+      // A (bot, chat) board that already tracks this child (by entry id).
+      // key = k(botId, chatId).
       const boardTracking = (sid) => {
-        for (const [chatId, board] of subagentBoards) {
-          if (board.entries.has(sid)) return { chatId, board };
+        for (const [key, board] of subagentBoards) {
+          if (board.entries.has(sid)) {
+            const bi = key.indexOf('::');
+            return { botId: bi >= 0 ? key.slice(0, bi) : 'default', chatId: bi >= 0 ? key.slice(bi + 2) : key, board };
+          }
         }
         return null;
       };
@@ -2466,15 +2964,15 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         const sid = info?.id != null ? String(info.id) : null;
         if (!sid) return;
         const child = findChild(sid);
-        const viaParent = child ? chatOfChildSession(child.session) : null;
-        let chatId = viaParent || boardTracking(sid)?.chatId || null;
+        const viaParent = child ? ownerOfChildSession(child.session) : null;
+        const tracked = viaParent || boardTracking(sid) || null;
         if (phase === 'start' && !child) {
           // Child not (yet) in the live list: defer to the presence sweep, which
           // will start it on the right chat — avoid a phantom row on the default.
           return;
         }
-        if (!chatId) return;
-        const board = boardForChat(chatId);
+        if (!tracked) return;
+        const board = boardForChat(tracked.botId, tracked.chatId);
         if (phase === 'start') board.onStart(info);
         else board.onEnd(info);
         ensureBoardTicker();
@@ -2492,11 +2990,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       ensureBoardTicker();
     }
 
-    // Tear down a chat's board (unpin + delete) — called on /new and unload.
-    async function teardownBoardForChat(chatId) {
-      const board = subagentBoards.get(String(chatId));
+    // Tear down a (bot, chat) board (unpin + delete) — called on /new and unload.
+    async function teardownBoardForChat(botId, chatId) {
+      const key = k(botId, chatId);
+      const board = subagentBoards.get(key);
       if (board) {
-        subagentBoards.delete(String(chatId));
+        subagentBoards.delete(key);
         try { await board.teardown(); } catch { /* best-effort */ }
       }
     }
@@ -2504,12 +3003,13 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     // Board lives only while polling is on, so its teardown is registered here
     // (the top-level unload effect below is out of scope for these bindings).
     // On unload: stop the ticker and unpin/delete every live board.
+    // keys are composite k(botId, chatId); get/delete by the same key.
     ctx.effect(() => {
       return () => {
         stopBoardTicker();
-        for (const chatId of [...subagentBoards.keys()]) {
-          const b = subagentBoards.get(chatId);
-          subagentBoards.delete(chatId);
+        for (const key of [...subagentBoards.keys()]) {
+          const b = subagentBoards.get(key);
+          subagentBoards.delete(key);
           try { void b.teardown(); } catch { /* best-effort */ }
         }
       };
@@ -2553,18 +3053,30 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       try { agent?.session?.append?.('sandbox/mode', { mode }); } catch { /* ignore */ }
     }
 
+    // v0.5.x P2: autopilotChats is keyed by k(botId, chatId). The module-facing
+    // helpers (isAutopilotChat / autopilotStateFor) are called with a RAW chatId
+    // (the approval/question modules only know the chatId, not the bot), so they
+    // scan every (bot, chatId) key sharing that chatId. A chat is "in autopilot"
+    // if ANY bot has it on. This is correct because the ownership() that feeds
+    // them already resolved the chat from a specific agent.
     function autopilotStateFor(chatId) {
-      return autopilotChats.get(String(chatId)) ?? null;
+      const cid = String(chatId);
+      for (const [key, state] of autopilotChats) {
+        const bi = key.indexOf('::');
+        const keyChat = bi >= 0 ? key.slice(bi + 2) : key;
+        if (keyChat === cid && state?.on) return state;
+      }
+      return null;
     }
 
     function isAutopilotChat(chatId) {
-      const s = autopilotChats.get(String(chatId));
-      return !!(s && s.on);
+      return !!autopilotStateFor(chatId);
     }
 
-    // Enable autopilot for a chat's agent: capture the current sandbox mode, then
-    // switch the agent to the configured full-write mode. Returns the state entry.
-    function enableAutopilot(chatId, agent) {
+    // Enable autopilot for a (bot, chat) agent: capture the current sandbox mode,
+    // then switch the agent to the configured full-write mode. Returns state entry.
+    function enableAutopilot(botId, chatId, agent) {
+      const key = k(botId, chatId);
       const prev = effectiveSandboxModeOf(agent);
       setAgentSandboxMode(agent, c.autopilotSandboxMode || 'danger-full-access');
       const state = {
@@ -2573,19 +3085,20 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         agentId: String(agent?.session?.id ?? agent?.id ?? ''),
         since: Date.now(),
       };
-      autopilotChats.set(String(chatId), state);
+      autopilotChats.set(key, state);
       // Fresh cycle → allow exactly one autopilot approval notice this session
       // (later auto-grants stay silent; see approval.js).
       approvalClearNotice?.(chatId);
       return state;
     }
 
-    // Disable autopilot for a chat: restore the captured sandbox mode (if the
-    // deployment default was in force, re-append 'workspace-write' to drop any
-    // override — the deployment default already confines). Returns the prior state.
-    function disableAutopilot(chatId, agent) {
-      const state = autopilotChats.get(String(chatId)) ?? null;
-      autopilotChats.delete(String(chatId));
+    // Disable autopilot for a (bot, chat): restore the captured sandbox mode (if
+    // the deployment default was in force, re-append 'workspace-write' to drop any
+    // override). Returns the prior state.
+    function disableAutopilot(botId, chatId, agent) {
+      const key = k(botId, chatId);
+      const state = autopilotChats.get(key) ?? null;
+      autopilotChats.delete(key);
       approvalClearNotice?.(chatId); // cleanup: no notice state lingers
       if (state?.on && agent) {
         const restore = state.prevSandbox ?? 'workspace-write';
@@ -2604,8 +3117,14 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       const sidStr = String(sessionId ?? '');
       const hit = all.find((a) => String(a?.id) === sidStr || String(a?.session?.id) === sidStr);
       const hitSid = String(hit?.session?.id ?? sidStr ?? '');
-      for (const [cid, csid] of chatAgents) {
-        if (String(csid) === hitSid && isAutopilotChat(cid)) return { chatId: String(cid), threadId: null };
+      for (const [key, csid] of chatAgents) {
+        if (String(csid) === hitSid) {
+          const bi = key.indexOf('::');
+          const chatPart = bi >= 0 ? key.slice(bi + 2) : key;
+          if (isAutopilotChat(chatPart)) {
+            return { chatId: chatPart, threadId: null };
+          }
+        }
       }
       if (defaultChatId && isAutopilotChat(defaultChatId)) {
         const defId = String(all[0]?.session?.id ?? '');
@@ -2691,7 +3210,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
-    async function handleCommands(message) {
+    async function handleCommands(botId, message) {
       // Returns true when the message was a command (already handled).
       const extracted = await extractCommand(message);
       if (!extracted) return false;
@@ -2699,9 +3218,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       const chatId = String(message.chatId);
       const agentsSvc = ctx.get?.('agents');
       const all = agentsSvc?.list?.() ?? [];
-      const active = resolveChatAgent(chatId);
+      const active = resolveChatAgent(botId, chatId);
       // Command replies are plugin-authored Telegram HTML (tags preserved).
-      const reply = (t) => sendText(chatId, t, { replyToMessageId: message.messageId, html: true });
+      const reply = (t) => sendText(botId, chatId, t, { replyToMessageId: message.messageId, html: true });
 
       try {
         switch (cmd) {
@@ -2737,9 +3256,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
             // Drop this chat's subagent board so stale rows from the old
             // session don't linger; a fresh board appears as the new session
             // spawns subagents.
-            try { await teardownBoardForChat(chatId); } catch { /* best-effort */ }
-            const id = await createTelegramAgent(chatId);
-            chatAgents.set(chatId, id);
+            try { await teardownBoardForChat(botId, chatId); } catch { /* best-effort */ }
+            const id = await createTelegramAgent(botId, chatId);
+            chatAgents.set(k(botId, chatId), id);
             const short = id.length > 20 ? id.slice(0, 8) + '…' : id;
             await reply(`✅ 已开启新会话 <code>${short}</code>（完整 id 见 /sessions）。\n上下文已清空，后续消息路由到新会话。`);
             return true;
@@ -2747,7 +3266,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
           case '/sessions': {
             if (all.length === 0) { await reply('（当前没有活动会话）'); return true; }
-            const activeId = chatAgents.get(chatId);
+            const activeId = chatAgents.get(k(botId, chatId));
             const lines = all.map((a, i) => {
               const aid = String(a?.session?.id ?? `agent-${i}`);
               const mark = aid === activeId ? '👉 ' : (i === 0 ? '🏠 ' : '   ');
@@ -2768,7 +3287,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
               return aid === targetId || aid.startsWith(targetId);
             });
             if (!hit) { await reply(`❌ 未找到会话 <code>${escapeHtml(targetId)}</code>。用 /sessions 查看。`); return true; }
-            chatAgents.set(chatId, String(hit.session.id));
+            chatAgents.set(k(botId, chatId), String(hit.session.id));
             await reply(`✅ 已切换到会话 <code>${String(hit.session.id).slice(0, 12)}</code>。`);
             return true;
           }
@@ -2929,7 +3448,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
                 await reply('（autopilot 当前未开启）');
                 return true;
               }
-              disableAutopilot(chatId, agent);
+              disableAutopilot(botId, chatId, agent);
               await reply(`🛡️ 已关闭 autopilot（会话 <code>${escapeHtml((agent?.session?.id ?? '').slice(0, 12))}</code>）。\n权限已恢复为 <code>${escapeHtml(s.prevSandbox ?? 'workspace-write')}</code> + 需审批，提问会重新等待你选择。`);
               return true;
             }
@@ -2943,7 +3462,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
               await reply('❌ 没有可用会话。请先 /new 新建会话，再 /autopilot 开启。');
               return true;
             }
-            enableAutopilot(chatId, agent);
+            enableAutopilot(botId, chatId, agent);
             const short = String(agent?.session?.id ?? '').slice(0, 12);
             // Explicit security warning (required by the feature spec).
             await reply([
@@ -2971,20 +3490,30 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       }
     }
 
-    poller.onMessage(async (message) => {
+    // v0.5.x P3: per-bot message handler. botId is the SOURCE bot of the
+    // message; all filters / client calls / sends / agent routing below use
+    // THAT bot's config + client (not the top-level single-bot bindings).
+    async function handleIncomingMessage(botId, message) {
+      const bEntry = botRegistry.get(botId) ?? {};
+      const bCfg = bEntry.cfg || {};
+      // Per-bot filter config (fall back to the top-level values for the legacy
+      // single-bot config, where bCfg is the 'default' bot carrying those).
+      const bAllowedChats = Array.isArray(bCfg.allowedChats) ? bCfg.allowedChats : allowedChats;
+      const bAllowedUsers = Array.isArray(bCfg.allowedUsers) ? bCfg.allowedUsers : allowedUsers;
+      const bRequireMention = bCfg.requireMention !== undefined ? bCfg.requireMention : requireMention;
       const sender = message.senderUsername || message.senderName || message.senderId;
-      log('info', `Message from ${sender} in chat ${message.chatId}: ${message.text?.slice(0, 100) || '(media)'}`);
+      log('info', `Message from ${sender} in chat ${message.chatId} (bot=${botId}): ${message.text?.slice(0, 100) || '(media)'}`);
 
-      if (allowedChats.length && !allowedChats.includes(message.chatId)) return;
-      if (allowedUsers.length && !allowedUsers.includes(message.senderId)) return;
+      if (bAllowedChats.length && !bAllowedChats.includes(message.chatId)) return;
+      if (bAllowedUsers.length && !bAllowedUsers.includes(message.senderId)) return;
 
-      if (requireMention && (message.chatType === 'group' || message.chatType === 'supergroup')) {
-        const bot = await client.getMe();
+      if (bRequireMention && (message.chatType === 'group' || message.chatType === 'supergroup')) {
+        const bot = meFor(botId);
         if (!message.text?.includes(`@${bot.username}`)) return;
       }
 
       // Plan A commands: /new, /sessions, /use <id>, /help
-      if (message.text && await handleCommands(message)) return;
+      if (message.text && await handleCommands(botId, message)) return;
 
       // ask_user_question custom answer (v0.4.4): if the agent is waiting on a
       // single-question card for this chat and the user replies with plain text
@@ -2996,28 +3525,32 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         return;
       }
 
-      // Dedup: skip if we already injected this message id (poller-level
-      // dedup is the primary gate; this is a second line of defence for
-      // handler-level retries).
-      const dedupKey = `${message.chatId}:${message.messageId}`;
+      // Dedup: skip if we already injected this message id (poller-level dedup
+      // is the primary gate; this is a second line of defence for handler-level
+      // retries). Per-bot: the key is scoped to the source bot via k() so the
+      // same (chatId, messageId) arriving under two bots is not cross-deduped.
+      const dedupKey = `${k(botId, message.chatId)}:${message.messageId}`;
       if (injectedIds.has(dedupKey)) return;
 
       const hasMedia = !!(message.photo || message.document || message.video
         || message.audio || message.voice);
       if (message.text || hasMedia) {
-        // Show typing action
-        await client.sendChatAction(message.chatId, 'typing', message.messageThreadId);
+        // Show typing action (source bot's client).
+        const bClient = clientFor(botId);
+        await bClient.sendChatAction(message.chatId, 'typing', message.messageThreadId);
 
         // Inject message to agent session if enabled
-        const currentAgent = resolveChatAgent(message.chatId);
+        const currentAgent = resolveChatAgent(botId, message.chatId);
 
         // If the agent is already running a (long) task, a new message is
         // queued as a next-turn follow-up and won't be answered until that
         // task finishes. Without an ack the user stares at silence for the
         // whole duration — that read as "the bot isn't responding". Send a
-        // single, quiet "queued" notice so the wait is visible.
+        // single, quiet "queued" notice (back to the SOURCE bot) so the wait
+        // is visible.
         if (injectToAgent && currentAgent && currentAgent.status === 'running') {
           void sendText(
+            botId,
             String(message.chatId),
             '⏳ 正在处理上一个任务，这条消息已加入队列，完成后会接着回复。',
             { replyToMessageId: message.messageId, messageThreadId: message.messageThreadId, disableNotification: true },
@@ -3031,7 +3564,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
             let mediaNote = '';
             let imageBlock = null;
             if (hasMedia && forwardInboundMedia) {
-              const fm = await downloadAndDescribeInboundMedia(message);
+              const fm = await downloadAndDescribeInboundMedia(botId, message);
               mediaNote = fm.note;
               imageBlock = fm.imageBlock;
 
@@ -3042,7 +3575,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
               if (inboundMediaKind(message) === 'voice' && voiceTranscribe && fm.localPath) {
                 const transcript = await transcribeVoiceFile(fm.localPath, voiceTranscribeLanguage);
                 if (transcript) {
-                  void sendPlainText(String(message.chatId), `🎧 ${transcript}`, {
+                  void sendPlainText(botId, String(message.chatId), `🎧 ${transcript}`, {
                     replyToMessageId: message.messageId,
                     messageThreadId: message.messageThreadId,
                     disableNotification: true,
@@ -3113,13 +3646,13 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
             // Live progress indicator (tool calls + thinking) — works in both
             // response modes; it self-cleans when the turn ends.
-            startProgressForAgent(currentAgent, message.chatId, baseline, message.messageThreadId);
+            startProgressForAgent(currentAgent, botId, message.chatId, baseline, message.messageThreadId);
 
             if (agentResponseMode === 'direct' && !streamingReplyEnabled) {
               // Auto-capture the agent's final text for this turn and send it.
               // (When streaming is enabled the ProgressIndicator finalizes the
               // reply in place — see onFinalReply — so we must NOT double-send.)
-              void watchDirectReply(currentAgent, message.chatId, message.messageId);
+              void watchDirectReply(currentAgent, botId, message.chatId, message.messageId);
             }
             return;
           } catch (err) {
@@ -3130,11 +3663,11 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         }
 
         // Fallback (no agent / injection off): brief echo so the user knows
-        // the bot saw it.
+        // the bot saw it. Sent via the SOURCE bot's client.
         const echoText = message.text
           ? `Received your message: "${message.text.slice(0, 100)}"`
           : `I received a ${inboundMediaKind(message)}.`;
-        await client.sendMessage({
+        await clientFor(botId).sendMessage({
           chatId: message.chatId,
           text: echoText,
           parseMode: parseMode,
@@ -3142,7 +3675,9 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
           messageThreadId: message.messageThreadId,
         });
       }
-    });
+    }
+
+    activePoller.onMessage(async (message) => handleIncomingMessage(firstBotId, message));
 
     // ---------------------------------------------------------------------
     // Tool-guard approval (parity with QwenPaw's tool_guard card).
@@ -3156,7 +3691,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     // runs first, claim only the agents we created (session id `telegram-*`,
     // resolvable to a chat), and `next()` the rest so the web answerer keeps
     // working for web-originated agents. The card is an inline keyboard; the
-    // poller's callback handler below resolves the promise when the user taps.
+    // activePoller's callback handler below resolves the promise when the user taps.
     // ---------------------------------------------------------------------
     // Shared ownership policy: does this agent's session belong to us, and to
     // which Telegram chat does it route? Used by BOTH the approval answerer
@@ -3175,11 +3710,23 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       const sidStr = String(hit?.session?.id ?? askId ?? '');
 
         // Case 1 — this plugin's own agents (session id `telegram-*`, created
-        // by /new or a fresh chat). Route to the owning chat, else default.
+        // by /new or a fresh chat). Route to the owning (bot, chat); the
+        // composite key carries both, so the chat part is the routing target.
         if (sidStr.startsWith(TELEGRAM_SESSION_PREFIX)) {
           let chatId = null;
-          for (const [cid, csid] of chatAgents) {
-            if (String(csid) === sidStr) { chatId = String(cid); break; }
+          for (const [key, csid] of chatAgents) {
+            if (String(csid) === sidStr) {
+              const bi = key.indexOf('::');
+              chatId = bi >= 0 ? key.slice(bi + 2) : key;
+              break;
+            }
+          }
+          // v0.5.x P2: fall back to the per-bot default of the agent's own bot
+          // (meta.botId), NOT the top-level default. For the legacy config the
+          // default bot's defaultChatId IS the top-level defaultChatId.
+          if (!chatId && hit?.meta?.botId) {
+            const cfg = botRegistry.get(hit.meta.botId)?.cfg;
+            if (cfg?.defaultChatId) chatId = String(cfg.defaultChatId);
           }
           if (!chatId && defaultChatId) chatId = String(defaultChatId);
           if (!chatId) return null;
@@ -3199,9 +3746,16 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         return null;
       };
 
+    // v0.5.x P2/P3: the modules take ONE client (their `client` dep). We hand
+    // them clientDispatch — a client-shaped object that resolves the owning
+    // bot per call via the pending card's chatId (composite key). For the
+    // legacy single-bot config this always resolves to the default bot, i.e.
+    // exactly the old `activeClient` — behavior unchanged.
+    const moduleClient = clientDispatch;
+
     if (approvalEnabled && typeof ctx.on === 'function') {
       const approvalModule = createApprovalModule({
-        client,
+        activeClient: moduleClient,
         enabled: () => approvalEnabled,
         timeoutMs: approvalTimeoutMs,
         log,
@@ -3209,8 +3763,12 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
         ownership: (agent) => telegramAgentOwnership(agent?.id ?? agent?.session?.id, { allowDefault: approvalForDefaultAgent }),
         // Autopilot: auto-grant every ask for a chat in autopilot mode (no card).
         isAutopilot: (chatId) => isAutopilotChat(chatId),
+        // ackCallback routes through the per-bot dispatch (the module holds
+        // clientDispatch as its `activeClient`); answerCallbackQuery carries
+        // no chatId, so the dispatch falls back to the active-card bot context
+        // (set in onCallbackQuery). Legacy config → always the default bot.
         ackCallback: (qid, toast) => {
-          if (qid) return client.answerCallbackQuery(qid, toast);
+          if (qid) return clientDispatch.answerCallbackQuery(qid, toast);
           return Promise.resolve();
         },
         toastText: (outcome) =>
@@ -3255,7 +3813,7 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
     // consumed as a custom answer. Best-effort: a loopback failure never
     // affects the real reply — the web UI keeps working.
     // ---------------------------------------------------------------------
-    if (questionsEnabled && client) {
+    if (questionsEnabled && activeClient) {
       const respondQuestion = async (body) => {
         const res = await fetch(`${webUrl.replace(/\/$/, '')}/api/respond`, {
           method: 'POST',
@@ -3268,16 +3826,21 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       const questionModule = createQuestionModule({
         log,
         escape: (s) => escapeHtml(s),
-        client,
+        // v0.5.x P3: per-bot client dispatch (the module holds ONE client dep;
+        // clientDispatch routes each call to the owning bot via the card's
+        // chatId / active-card context). Legacy config → always default bot.
+        activeClient: moduleClient,
         ownership: (sessionId) => telegramAgentOwnership(sessionId, { allowDefault: questionsForDefaultAgent }),
         respond: respondQuestion,
         // Autopilot (v0.5.0): auto-adopt the recommended option when the owning
         // chat is in autopilot mode, then commit after the takeover window.
         isAutopilot: (chatId) => isAutopilotChat(chatId),
-        autopilotWindowMs: Number(c.autopilotWindowMs) || 0,
+        // The module only knows the chatId; resolve the owning bot from the
+        // composite-keyed chatAgents map, then (bot, chat)-scoped disable.
         autopilotTakeover: (chatId) => {
-          const ag = resolveChatAgent(chatId);
-          disableAutopilot(chatId, ag);
+          const bid = botIdForChat(chatId);
+          const ag = resolveChatAgent(bid, chatId);
+          disableAutopilot(bid, chatId, ag);
         },
       });
       questionHandleQuery = questionModule.handleCallbackQuery;
@@ -3291,40 +3854,96 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
       log('info', `ask_user_question answerer registered (subscribed to ${webUrl}/api/events.mux).`);
     }
 
-    poller.onCallbackQuery(async (query) => {
-      log('info', `Callback query from ${query.from.username || query.from.id}: data="${query.data}"`);
+    // Per-bot callback handler (v0.5.x P3): the SOURCE bot is derived from the
+    // query's chat (button cards carry their chat). Setting the active-card
+    // bot context routes the modules' chat-less client calls (answerCallback
+    // Query) to the right bot. Legacy config → always 'default'.
+    const handleCallbackQuery = async (botId, query) => {
+      const qChat = query?.message?.chat?.id;
+      if (qChat != null) setActiveCardBotId(botIdForChat(qChat) || botId);
+      log('info', `Callback query from ${query.from.username || query.from.id} (bot=${botId}): data="${query.data}"`);
       // Route button taps to the owning module (each acks its own callback).
       // Tool-guard approval first, then ask_user_question. Anything else falls
-      // through to a plain ack.
+      // through to a plain ack on the SOURCE bot.
       if (approvalHandleQuery && approvalHandleQuery(query)) return;
       if (questionHandleQuery && (await questionHandleQuery(query))) return;
-      await client.answerCallbackQuery(query.id, 'Acknowledged');
-    });
+      await clientFor(botId).answerCallbackQuery(query.id, 'Acknowledged');
+    };
+
+    activePoller.onCallbackQuery(async (query) => handleCallbackQuery(firstBotId, query));
 
     // Register the bot command menu so Telegram clients show it in the
     // "/" autocomplete (Bot API setMyCommands). Keep in sync with
-    // handleCommands below.
-    try {
-      await client.setMyCommands([
-        { command: 'new', description: '新建会话（清空上下文）' },
-        { command: 'clear', description: '同 /new：新建会话' },
-        { command: 'stop', description: '停止当前任务' },
-        { command: 'compact', description: '压缩会话历史为摘要' },
-        { command: 'history', description: '查看最近对话记录' },
-        { command: 'model', description: '查看/切换模型（/model list 列出）' },
-        { command: 'sessions', description: '列出活动会话' },
-        { command: 'use', description: '切换到指定会话（/use <id>）' },
-        { command: 'approval', description: '查看/管理「一直允许」授权（/approval clear 清空）' },
-        { command: 'autopilot', description: '全自动模式：全局写权限+自动放行授权（/autopilot on|off|status）' },
-        { command: 'help', description: '显示帮助' },
-      ]);
-      log('info', 'Registered Telegram command menu (setMyCommands).');
-    } catch (err) {
-      log('warn', 'setMyCommands failed (command menu may be missing):', err.message);
+    // handleCommands below. v0.5.x P3: register on EVERY bot's own client
+    // (a menu is per-bot, not global) — each bot that has a client gets its
+    // own setMyCommands; failures are non-fatal (menu just missing).
+    const commandMenu = [
+      { command: 'new', description: '新建会话（清空上下文）' },
+      { command: 'clear', description: '同 /new：新建会话' },
+      { command: 'stop', description: '停止当前任务' },
+      { command: 'compact', description: '压缩会话历史为摘要' },
+      { command: 'history', description: '查看最近对话记录' },
+      { command: 'model', description: '查看/切换模型（/model list 列出）' },
+      { command: 'sessions', description: '列出活动会话' },
+      { command: 'use', description: '切换到指定会话（/use <id>）' },
+      { command: 'approval', description: '查看/管理「一直允许」授权（/approval clear 清空）' },
+      { command: 'autopilot', description: '全自动模式：全局写权限+自动放行授权（/autopilot on|off|status）' },
+      { command: 'help', description: '显示帮助' },
+    ];
+    for (const entry of botRegistry.values()) {
+      if (!entry.client) continue; // token-missing bot is skipped (no client)
+      try {
+        await entry.client.setMyCommands(commandMenu);
+        log('info', `Registered Telegram command menu (setMyCommands) for bot "${entry.id}".`);
+      } catch (err) {
+        log('warn', `setMyCommands failed for bot "${entry.id}" (command menu may be missing):`, err.message);
+      }
     }
 
-    poller.start();
+    activePoller.start();
     log('info', 'Telegram poller started.');
+    // Link this poller into the registry for the first bot, and keep the
+    // legacy `poller` binding (used by the top-level unload effect below).
+    const firstEntry = [...botRegistry.values()].find((e) => e.client === activeClient);
+    if (firstEntry) {
+      firstEntry.poller = activePoller;
+      poller = activePoller;
+    }
+
+    // Multi-bot (v0.5.x): start a poller for EVERY OTHER bot that has a
+    // client (the first one above is the legacy/single-bot path). Each poller
+    // uses its own bot's per-bot config. The first bot's poller keeps the
+    // existing top-level config so the legacy single-bot path is unchanged.
+    for (const entry of botRegistry.values()) {
+      if (!entry.client || entry.client === activeClient) continue;
+      const bcfg = entry.cfg;
+      const bPoller = new TelegramPoller(entry.client, {
+        allowedChats: (Array.isArray(bcfg.allowedChats) && bcfg.allowedChats.length) ? bcfg.allowedChats : undefined,
+        allowedUsers: (Array.isArray(bcfg.allowedUsers) && bcfg.allowedUsers.length) ? bcfg.allowedUsers : undefined,
+        requireMention: bcfg.requireMention !== undefined ? bcfg.requireMention : requireMention,
+        longPollTimeout: Number(bcfg.longPollTimeout) > 0 ? Number(bcfg.longPollTimeout) : longPollTimeout,
+        verbose,
+        // Per-bot offset store so each bot tracks its own update cursor
+        // (defaults to $DSH_HOME/telegram-poller-offset-<botId>.json).
+        offsetKey: bcfg.id,
+      });
+      entry.poller = bPoller;
+      // v0.5.x P3: each non-first bot's poller routes its messages + callback
+      // queries through the SAME handlers, but with THAT bot's id as the
+      // source (filters/client/sends/agent routing all use entry.id).
+      bPoller.onMessage((msg) => handleIncomingMessage(entry.id, msg));
+      bPoller.onCallbackQuery((q) => handleCallbackQuery(entry.id, q));
+      bPoller.start();
+      log('info', `Telegram poller started for bot "${bcfg.id}".`);
+    }
+    // v0.5.x P5/P6: expose this run's closure-scoped per-bot ownership + board
+    // helpers to tests (see __testHooks). MUST live inside the
+    // `if (pollingEnabled && client)` block — these helpers are block-scoped
+    // and defined above, so the assignment is only in scope here.
+    __testHooks.rootAgentToChat = rootAgentToChat;
+    __testHooks.ownerOfChildSession = ownerOfChildSession;
+    __testHooks.boardForChat = boardForChat;
+    __testHooks.chatAgents = chatAgents;
   }
 
   // -----------------------------------------------------------------------
@@ -3333,7 +3952,13 @@ Markdown in the text will be converted to Telegram HTML format automatically (wh
 
   ctx.effect(() => {
     return () => {
-      poller?.stop();
+      // Multi-bot (v0.5.x): stop EVERY poller registered for every bot. The
+      // legacy single `poller` binding is now one of these registry entries,
+      // so this covers the legacy single-bot path AND any extra bots. (The
+      // remaining cleanup below is unchanged.)
+      for (const entry of botRegistry.values()) {
+        try { entry.poller?.stop?.(); } catch { /* ignore */ }
+      }
       // Cancel any in-flight approval cards so their answerer promises settle
       // (cancelled) rather than hanging after unload.
       try { approvalCancel?.(); } catch { /* ignore */ }

@@ -168,6 +168,11 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
   let storePath = '';
 
   const _path = () => (typeof filePath === 'function' ? (filePath() || '') : (staticPath || ''));
+  // defaultChatId may be a value OR a lazily-resolved function (multi-bot:
+  // resolve the SOURCE bot's default per the active-card context at the time a
+  // rule is remembered, rather than freezing the top-level value at store
+  // creation). Backward-compatible: a plain value keeps working unchanged.
+  const _defaultChat = () => String(typeof defaultChatId === 'function' ? (defaultChatId() || '') : (defaultChatId || ''));
 
   function load() {
     storePath = _path();
@@ -179,7 +184,7 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
       rules = new Map();
       for (const r of list) {
         if (r && typeof r.key === 'string') {
-          rules.set(r.key, { chatId: typeof r.chatId === 'string' ? r.chatId : (defaultChatId || null), at: Number(r.at) || Date.now() });
+          rules.set(r.key, { chatId: typeof r.chatId === 'string' ? r.chatId : (_defaultChat() || null), at: Number(r.at) || Date.now() });
         }
       }
     } catch {
@@ -213,7 +218,7 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
   function rememberAllow(ruleKey, chatId) {
     const k = String(ruleKey);
     if (!k) return;
-    rules.set(k, { chatId: (chatId || defaultChatId || null), at: Date.now() });
+    rules.set(k, { chatId: (chatId || _defaultChat() || null), at: Date.now() });
     persist();
   }
   function clearRule(ruleKey) {

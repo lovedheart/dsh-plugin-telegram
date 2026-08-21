@@ -25,7 +25,7 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `telegram_send_document` | Send a document to a chat |
 | `telegram_edit_message` | Edit an existing message |
 | `telegram_delete_message` | Delete a message |
-| `telegram_get_info` | Get bot info and config status |
+| `telegram_get_info` | Get info about all configured bot(s) — returns an array, one entry per bot |
 | `telegram_get_updates` | Manually poll for new updates |
 | `telegram_get_last_assistant_message` | Read the latest assistant message of the current session (debug/test helper) |
 
@@ -154,6 +154,113 @@ dsh web --patch ./cordis.yml
 | `subagentBoardIncludeDescendants` | boolean | `false` | When `true`, also show nested subagents (a subagent that spawns another). Default shows only direct children. |
 | `subagentBoardMaxRows` | number | `10` | Cap on subagents shown before the overflow collapses into a `… 另有 K 个未显示` line (keeps the message under Telegram's 4096-char limit). |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
+
+### Multi-Bot Configuration
+
+Run **multiple Telegram bots** in one plugin instance. Add a top-level `bots:`
+array; every item is one bot. This is a v0.5.x feature — the legacy single-bot
+config (top-level fields, no `bots`) keeps working unchanged (see "Backward
+compatibility" below).
+
+Each `bots[]` item supports the same per-bot fields as the top-level config. An
+item field left **unset falls back to the top-level value** of the same field, so
+you only spell out what differs per bot.
+
+| Field | Type | Default (when unset) | Description |
+|-------|------|----------------------|-------------|
+| `id` | string | auto | Bot id used for routing (see "id auto-generation"). Must be **unique** across `bots` (duplicates throw at startup). |
+| `token` | string | top-level `botToken` | Bot token. `botToken` is an accepted alias (either name works on an item). |
+| `envKey` | string | `"TELEGRAM_BOT_TOKEN"` | Env var to read the token from (per-bot, so two bots read two different vars — no crosstalk). |
+| `credentialKey` | string | same as `envKey` | DSH credentials key to fall back to for this bot's token. |
+| `baseUrl` | string | top-level `baseUrl` | Per-bot custom API base URL. |
+| `defaultChatId` | string | top-level `defaultChatId` | Per-bot default chat (used for card/approval routing and `/new` follow-ups). |
+| `allowedChats` | string[] | top-level `allowedChats` | Per-bot allowed chat ids (empty = all). |
+| `allowedUsers` | string[] | top-level `allowedUsers` | Per-bot allowed user ids (empty = all). |
+| `requireMention` | boolean | top-level `requireMention` | Per-bot group @mention requirement (filtered against **that bot's** `getMe`). |
+| `injectToAgent` | boolean | top-level `injectToAgent` | Per-bot message injection into the agent loop. |
+| `agentResponseMode` | string | top-level `agentResponseMode` | Per-bot `'tool'` / `'direct'` reply mode. |
+
+Other top-level fields (`longPollTimeout`, `maxMessageLength`, `parseMode`,
+`pollingEnabled`, `replyPrefix`, …) are also readable per item when set.
+
+**id auto-generation** — when an item has no `id`:
+- it has a resolvable `token` → id = `"bot-" + token.slice(0, 8)`;
+- otherwise (no token) → id = `"default"`.
+- The legacy single-bot fallback (no `bots` field) always yields id `"default"`.
+
+**Backward compatibility** — omit `bots` (or set `bots: []` / a YAML-coerced
+`{}`): the plugin builds **one** bot, id `"default"`, entirely from the
+top-level fields. Existing single-bot `cordis.yml` files need **no change** and
+behave bit-identically.
+
+**Missing-token degradation** — a bot whose token resolves to nothing
+(config + `envKey` + `credentialKey` all empty) is **skipped with a warn log**;
+it never throws. It is still registered (so `clientFor`/`meFor` report a precise
+"skipped" error) but gets no client/poller/command-menu. If **all** bots are
+skipped the plugin runs **tools-only** (tools still register; their `!client`
+guards return a helpful error when called) — the same "missing token → tools-only"
+semantics as the legacy path.
+
+**Per-bot token resolution priority** (per item, in order):
+`token` (plain) → `process.env[envKey]` → DSH credentials `credentialKey`.
+Using a distinct `envKey` per bot is the recommended way to avoid a second bot
+accidentally picking up the first bot's token.
+
+#### Sending tools & `telegram_get_info` under multi-bot
+
+- Every **send/edit/delete/media tool** (`telegram_send_message`, `telegram_send_photo`,
+  `telegram_send_document`, `telegram_edit_message`, `telegram_delete_message`, …) now
+  accepts an **optional `bot` parameter** (a bot id). Resolution order:
+  (1) explicit `bot` — must be a known, connected bot, else a clear tool error;
+  (2) the **owning bot of the target chat** (composite-key reverse lookup, the
+  bot whose poller last routed a message for that chat);
+  (3) the first/legacy bot. A single-bot config is unaffected.
+- **`telegram_get_info` now returns an ARRAY — one entry per configured bot**:
+  `{ id, username, botId, name, connected, defaultChat }`. A legacy single-bot
+  config returns exactly one entry (`id: "default"`), so single-bot callers see
+  one item as before.
+- **`telegram_get_updates`** accepts a `bot` parameter; each bot keeps its **own
+  manual poll offset** (independent per bot, and independent of that bot's
+  background poller), so a manual poll on one bot never advances another's stream.
+
+#### Two-bot example
+
+```yaml
+- insert:
+    - id: telegram
+      name: '/path/to/dsh-plugin-telegram/lib/index.js'
+      config:
+        pollingEnabled: true
+        longPollTimeout: 30
+        # Top-level values act as the per-bot defaults (inherited when an item omits a field).
+        requireMention: true
+        agentResponseMode: 'direct'
+        bots:
+          - id: alice
+            token: '123456...:AA...'        # or leave empty + envKey below
+            defaultChatId: '100000000'
+            allowedUsers: ['100000000']
+          - id: bob
+            envKey: 'TELEGRAM_BOT_TOKEN_BOB' # reads its own env var (no token on the item)
+            defaultChatId: '200000000'
+            allowedUsers: ['200000000']
+```
+
+#### Multi-bot caveats
+
+- **`chatId` is NOT globally unique across bots** — the same numeric `chatId` can
+  exist under two bots. So all per-chat state (dedup, board, indicator, agent
+  routing) is keyed by the **composite key `k(botId, chatId)`** (`"botId::chatId"`),
+  never by bare `chatId`. Messages are therefore **not cross-deduped** across bots:
+  the same `(chatId, messageId)` delivered through two different bots is processed
+  once per bot.
+- **Isolate tokens with `envKey`** so a second bot does not inherit the first
+  bot's `TELEGRAM_BOT_TOKEN` (the default `envKey`/`credentialKey` is the same
+  `TELEGRAM_BOT_TOKEN`; point each extra bot at its own key).
+- **`getUpdates` offset is per-bot** (Telegram maintains one update stream per
+  bot) — the plugin tracks a separate manual offset per bot for the
+  `telegram_get_updates` tool, and each background poller tracks its own cursor
+  (offset file `telegram-poller-offset-<botId>.json`).
 
 ### Inbound voice transcription (🎧)
 

@@ -69,6 +69,43 @@ Reply to it using the telegram_send_message tool with chat_id: 123456789.`,
    - **direct** mode: plugin awaits the turn finishing (agent idle + a new
      assistant message) and calls `telegram_send_message` with the final text
 
+## Multi-bot tool usage
+
+When **multiple bots** are configured (a `bots:` array in `cordis.yml`, see README
+"Multi-Bot Configuration"), the agent-facing tools change as follows:
+
+- **`telegram_get_info` returns an ARRAY**, one entry per configured bot:
+  `{ id, username, botId, name, connected, defaultChat }`. With a single-bot
+  config it is still exactly one entry (`id: "default"`), so existing code that
+  reads the first/only entry keeps working. To pick a bot by username, scan the
+  array; to target a specific bot in the tools below, use its `id`.
+
+- **Send / edit / delete / media tools take an optional `bot` parameter** (a bot
+  id). If omitted, the plugin routes to the **owning bot of the target chat**
+  (the bot whose poller last routed a message for that `chat_id`), falling back to
+  the first/legacy bot. Pass `bot: "<id>"` explicitly to force which bot sends,
+  or when the target chat has no owning-bot context. An unknown `bot` id returns
+  a clear tool error string (not a crash).
+
+- **`telegram_get_updates` takes a `bot` parameter.** Each bot keeps its **own**
+  manual poll offset, so polling one bot does not advance another bot's stream.
+  Default: the default/first bot.
+
+### Multi-bot caveats (agent-facing)
+
+- **`chatId` is not globally unique across bots.** The same numeric `chatId` can
+  exist under two bots, so the plugin keys all per-chat state by the composite
+  `k(botId, chatId)`. When routing a reply to "the chat you just received", rely
+  on the `chat_id` given in the injected message + the bot context — do not assume
+  a bare `chat_id` is unique across the whole plugin.
+- **`/new` and follow-up routing are per-bot.** A `/new` sent to bot A's chat
+  creates a bot-A-owned agent; it does not affect bot B's sessions. If you are
+  acting on behalf of a specific bot, include that bot's `id` in the `bot`
+  parameter of your sends so the reply lands on the right bot's client.
+- **Token isolation**: each bot should read its own token via a distinct
+  `envKey` / `credentialKey` (default is the shared `TELEGRAM_BOT_TOKEN`), so a
+  second bot never silently picks up the first bot's credentials.
+
 ## Autopilot — recommended option convention
 
 When a chat is in **autopilot** mode (see README "Autopilot (full-auto mode)"),
@@ -130,7 +167,7 @@ Non-text media (photo/document/video/audio/voice) is acknowledged with a short r
 
 **Messages not being processed by agent:**
 1. Verify `injectToAgent: true` in config
-2. Check `Agents service: yes` in `telegram_get_info` (resolves the `agents` ctx service)
+2. Check that `telegram_get_info` lists your bot(s) with `connected: true` (it returns an array, one entry per bot)
 3. Look for log lines `sent to agent for processing` / `Failed to inject message to agent`
 
 **Agent not responding to Telegram (tool mode):**
