@@ -89,6 +89,71 @@ config:
   botToken: '你的token'  # 不推荐
 ```
 
+#### 多 bot：设置多个 token
+
+配置 `bots:` 数组跑多个 bot 时，**每个 bot 一个 token，互相隔离**。隔离的关键是
+让每个 bot 指向**不同的来源键**——否则两个 bot 都会默认读同一个
+`TELEGRAM_BOT_TOKEN`，第二个 bot 会错误地拿到第一个 bot 的 token。
+
+三种方式的多 bot 写法（优先级从高到低，与单 bot 一致：
+`bots[].token`（明文）→ 环境变量 `process.env[envKey]` → DSH credentials）：
+
+**方式一：DSH Credentials 系统（推荐）** — 在 `$DSH_HOME/.credentials.yaml`
+里为每个 bot 写一条独立的凭据（key 名自取），再让每个 bot 的 `envKey`
+指向对应的 key：
+
+```yaml
+# $DSH_HOME/.credentials.yaml
+TELEGRAM_BOT_TOKEN: "alice的token"
+TELEGRAM_BOT_TOKEN_BOB: "bob的token"
+```
+
+```yaml
+# cordis.yml
+config:
+  pollingEnabled: true
+  bots:
+    - id: alice
+      envKey: 'TELEGRAM_BOT_TOKEN'        # 默认值，可省略
+    - id: bob
+      envKey: 'TELEGRAM_BOT_TOKEN_BOB'    # 指向自己的凭据 key
+```
+
+**方式二：环境变量** — 同样每个 bot 一个变量，`envKey` 指向它：
+
+```bash
+export TELEGRAM_BOT_TOKEN='alice的token'
+export TELEGRAM_BOT_TOKEN_BOB='bob的token'
+```
+
+```yaml
+config:
+  bots:
+    - id: alice        # envKey 默认 TELEGRAM_BOT_TOKEN
+    - id: bob
+      envKey: 'TELEGRAM_BOT_TOKEN_BOB'
+```
+
+**方式三：明文写在 cordis.yml 的 `bots[].token`（不推荐）**
+
+```yaml
+config:
+  bots:
+    - id: alice
+      token: '123456...:AA...'
+    - id: bob
+      token: '789012...:BB...'
+```
+
+要点：
+
+- **不填 `envKey` 的 bot 一律读 `TELEGRAM_BOT_TOKEN`**——多 bot 时除了第一个
+  bot，其余每个都必须给 `envKey`（或 `credentialKey`）指定不同的键。
+- 某个 bot 的 token 三个来源（明文 / 环境变量 / credentials）都取不到时，
+  该 bot **跳过并打 warn 日志**（不报错）；全部 bot 都取不到时插件降级为
+  tools-only（工具仍注册，调用时返回提示）。
+- 每个 bot 的完整字段与回退规则见下方 "Multi-Bot Configuration"。
+
 ### 2. Configure in cordis.yml
 
 ```yaml
@@ -202,7 +267,8 @@ guards return a helpful error when called) — the same "missing token → tools
 semantics as the legacy path.
 
 **Per-bot token resolution priority** (per item, in order):
-`token` (plain) → `process.env[envKey]` → DSH credentials `credentialKey`.
+`token` (plain) → `process.env[envKey]` → DSH credentials `envKey` → DSH
+credentials `credentialKey` (the last one only when it differs from `envKey`).
 Using a distinct `envKey` per bot is the recommended way to avoid a second bot
 accidentally picking up the first bot's token.
 
