@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-08-21
+
+### Added
+- **Multi-bot support — run several Telegram bots in one plugin instance.**
+  Add a top-level `bots:` array; each item is one bot (`id` / `token` /
+  `envKey` / `defaultChatId` / `allowedUsers` / `allowedChats` /
+  `requireMention`, plus any other per-bot field — an unset item field falls
+  back to the top-level value of the same field). The legacy single-bot config
+  (top-level fields, no `bots`) is unchanged and behaves bit-identically
+  (built as one bot, id `"default"`).
+  - **`botRegistry` + `clientFor(botId)`** — replaces the single implicit
+    client; there is no global "active client" switch, so two bots in the same
+    chat can never crosstalk.
+  - **Composite per-chat key `k(botId, chatId)`** (`"botId::chatId"`) for all
+    per-chat state — `chatAgents`, subagent boards, autopilot chats, live
+    indicators — since a numeric `chatId` is not unique across bots.
+  - **Send tools + `telegram_get_updates` accept an optional `bot` parameter**
+    (a bot id): explicit bot → else the owning bot of the target chat → else
+    the first/legacy bot. `telegram_get_info` now returns an **array** (one
+    entry per bot: `id` / `username` / `botId` / `name` / `connected` /
+    `defaultChat`); a single-bot config returns exactly one entry.
+  - **Per-bot pollers / offset files / token env keys** — each background
+    poller tracks its own cursor (`telegram-poller-offset-<botId>.json`) and
+    each bot reads its own `envKey` (default `TELEGRAM_BOT_TOKEN`).
+  - **Missing-token degradation** — a bot whose token resolves to nothing
+    (config + `envKey` + credentials) is skipped with a warn log (never
+    throws); if *all* bots are skipped the plugin runs tools-only.
+- **Multi-bot test coverage**: 32-case suite (`test/multi-bot.test.mjs`) plus a
+  real dual-bot end-to-end run against the live Telegram API (two bots, one
+  shared chat, independent routing — 17/17 checks).
+
+### Fixed
+- **Scope bug in card acknowledgement under multi-bot**: `chatAgents` /
+  `ownedHandles` were block-scoped and referenced from the callback path
+  (`ReferenceError` on card-ack with multiple bots); hoisted to function scope.
+
+### Changed
+- Docs: README "Multi-Bot Configuration" section; AGENT_INTEGRATION multi-bot
+  tool usage.
+- Bumped `0.5.0 → 0.6.0`.
+
 ## [0.5.0] - 2026-08-19
 
 ### Added

@@ -158,7 +158,7 @@ dsh web --patch ./cordis.yml
 ### Multi-Bot Configuration
 
 Run **multiple Telegram bots** in one plugin instance. Add a top-level `bots:`
-array; every item is one bot. This is a v0.5.x feature — the legacy single-bot
+array; every item is one bot. This is a v0.6.0 feature — the legacy single-bot
 config (top-level fields, no `bots`) keeps working unchanged (see "Backward
 compatibility" below).
 
@@ -588,20 +588,30 @@ dsh-plugin-telegram/
 ├── package.json        # Package metadata
 ├── README.md           # This file
 ├── src/
-│   ├── index.js        # Main plugin entry (tools + polling + agent injection)
-│   ├── client.js       # Telegram Bot API HTTP client (incl. pin/unpin)
-│   ├── poller.js       # Long-polling background service
+│   ├── index.js        # Main plugin entry (tools + bot registry + polling + agent injection)
+│   ├── client.js       # Telegram Bot API HTTP client (incl. pin/unpin, multipart upload)
+│   ├── poller.js       # Long-polling background service (per-bot)
 │   ├── text.js         # Pure text helpers (Markdown→HTML, fence-aware chunking)
+│   ├── approval.js     # Tool-guard approval cards (incl. "allow always" remember-rules)
+│   ├── questions.js    # ask_user_question cards (web-host mux bridge)
 │   └── subagents.js    # Live subagent board (state, render, throttled flush)
 ├── test/
-│   ├── text.test.mjs   # Unit tests for the pure text helpers
-│   ├── client.test.mjs # Unit tests for transient-error classification
-│   └── subagents.test.mjs # Unit tests for the subagent board
+│   ├── text.test.mjs           # Pure text helpers (chunking, Markdown→HTML)
+│   ├── client.test.mjs         # Transient-error classification, local-file upload
+│   ├── poller.test.mjs         # Poller loop / offset / dedup
+│   ├── progress.test.mjs       # Live-trajectory indicator
+│   ├── approval.test.mjs       # Approval cards + allow-always rules
+│   ├── questions.test.mjs      # Question cards + mux bridge
+│   ├── subagents.test.mjs      # Subagent board
+│   ├── command-media.test.mjs  # Command media helpers
+│   └── multi-bot.test.mjs      # Multi-bot config contract + routing (T1–T32)
 └── lib/                # Built output (copy of src/; `npm run prepare`)
     ├── index.js
     ├── client.js
     ├── poller.js
     ├── text.js
+    ├── approval.js
+    ├── questions.js
     └── subagents.js
 ```
 
