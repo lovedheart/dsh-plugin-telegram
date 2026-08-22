@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "prepare": "cp src/*.js lib/",
-    "test": "node test/text.test.mjs && node test/client.test.mjs && node test/poller.test.mjs && node test/progress.test.mjs && node test/approval.test.mjs && node test/questions.test.mjs && node test/subagents.test.mjs && node test/command-media.test.mjs && node test/multi-bot.test.mjs"
+    "test": "node test/questions-wiring.test.mjs && node test/text.test.mjs && node test/client.test.mjs && node test/poller.test.mjs && node test/progress.test.mjs && node test/approval.test.mjs && node test/questions.test.mjs && node test/subagents.test.mjs && node test/command-media.test.mjs && node test/multi-bot.test.mjs"
   },
   "license": "MIT",
   "peerDependencies": {
