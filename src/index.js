@@ -2092,17 +2092,28 @@ export async function apply(ctx, config) {
       if (typeof prop === 'symbol') return undefined;
       return (...args) => {
         let bid = null;
-        for (const a of args) {
-          if (a && typeof a === 'object' && !Array.isArray(a)) {
-            if (a.botId != null) bid = String(a.botId);
-            else if (a.chatId != null && !bid) bid = botIdForChat(a.chatId);
-          }
-        }
-        // Positional args: first string/number that is a chatId (edit/pin/
-        // unpin/sendChatAction all lead with chatId).
-        if (!bid) {
+        // answerCallbackQuery(callbackQueryId, text): the first positional arg
+        // is a callback TOKEN, not a chatId. The positional heuristic below
+        // would misread it as a chatId (botIdForChat → 'default' sentinel),
+        // clobbering the correct active-card bot and throwing clientFor('default')
+        // — which synchronously kills the whole submit branch before the answer
+        // POST runs (card never flips). Route it straight to the active-card bot
+        // the wrapper set from query.message.chat.id.
+        if (prop === 'answerCallbackQuery') {
+          bid = activeCardBotId || firstBotId || 'default';
+        } else {
           for (const a of args) {
-            if (typeof a === 'string' || typeof a === 'number') { bid = botIdForChat(a); break; }
+            if (a && typeof a === 'object' && !Array.isArray(a)) {
+              if (a.botId != null) bid = String(a.botId);
+              else if (a.chatId != null && !bid) bid = botIdForChat(a.chatId);
+            }
+          }
+          // Positional args: first string/number that is a chatId (edit/pin/
+          // unpin/sendChatAction all lead with chatId).
+          if (!bid) {
+            for (const a of args) {
+              if (typeof a === 'string' || typeof a === 'number') { bid = botIdForChat(a); break; }
+            }
           }
         }
         return clientFor(bid || activeCardBotId || 'default')[prop](...args);
