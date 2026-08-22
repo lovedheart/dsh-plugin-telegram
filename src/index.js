@@ -105,6 +105,7 @@ const defaults = {
   progressIntervalMs: 5000,     // min gap between trajectory message EDITS (was 1200; lowered frequency to cut API load / rate-limit risk)
   progressPerBlockChars: 240,   // max chars per trajectory line (reasoning/tool)
   progressMaxChars: 1500,       // max chars of the whole trajectory message
+  progressTrailLines: 3,        // streaming footer: recent activity lines under the reply (0 = off)
   progressTimeoutSec: 3600,  // absolute cap before the indicator self-cleans
   // Streaming reply (方案B, direct mode only). Instead of "wait for the turn to
   // end, then send the full reply", show the reply BUILDING in place: a
@@ -252,6 +253,7 @@ const schema = {
   progressIntervalMs: ['number'],
   progressPerBlockChars: ['number'],
   progressMaxChars: ['number'],
+  progressTrailLines: ['number'],
   progressTimeoutSec: ['number'],
   streamingReply: ['boolean'],
   forwardInboundMedia: ['boolean'],
@@ -735,6 +737,10 @@ export async function apply(ctx, config) {
   const progressIntervalMs = Math.max(1000, Number(c.progressIntervalMs) || 5000);
   const progressPerBlockChars = Math.max(40, Number(c.progressPerBlockChars) || 240);
   const progressMaxChars = Math.max(120, Number(c.progressMaxChars) || 1500);
+  const _ptl = Number(c.progressTrailLines);
+  const progressTrailLines = Number.isFinite(_ptl)
+    ? Math.max(0, Math.min(5, Math.floor(_ptl)))
+    : 3;
   const progressTimeoutMs = Math.max(30, Number(c.progressTimeoutSec) || 3600) * 1000;
 
   // Live subagent board options (see src/subagents.js). The board tracks the
@@ -1633,6 +1639,7 @@ export async function apply(ctx, config) {
       intervalMs: progressIntervalMs,
       perBlockChars: progressPerBlockChars,
       maxChars: progressMaxChars,
+      trailLines: progressTrailLines,
       timeoutMs: progressTimeoutMs,
       streaming,
       onFinalReply: streaming ? (cid, text, o) => finalizeStreamingReply(botId, cid, text, o) : undefined,

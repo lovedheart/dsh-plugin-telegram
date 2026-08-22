@@ -75,6 +75,12 @@ export class ProgressIndicator {
     // fold the whole log on every tick but skip already-seen events, so state
     // is never double-applied.
     this.processedSeq = this.o.baseline ?? 0;
+    // Streaming mode: how many recent activity lines (💭/🔧) to show under the
+    // 回复（生成中） body. 1 = the old single-line trail; 0 disables the block.
+    const _tl = Number(this.o.trailLines);
+    this.trailLines = Number.isFinite(_tl)
+      ? Math.max(0, Math.min(5, Math.floor(_tl)))
+      : 3;
     // Streaming reply (方案B, direct mode only): the SAME in-place message that
     // shows the activity trail also shows the final reply as it builds —
     // once `text-delta` events arrive, buildTraceText switches to the reply
@@ -152,7 +158,7 @@ export class ProgressIndicator {
       if (live) {
         const reply = compactText(live);
         const header = '💬 回复（生成中）\n';
-        const foot = this._latestActivityLine(max);
+        const foot = this._latestActivityLines();
         const bodyMax = Math.max(10, max - header.length - foot.length);
         const body = reply.length > bodyMax ? '…' + reply.slice(-(bodyMax - 1)) : reply;
         return header + body + foot;
@@ -179,23 +185,53 @@ export class ProgressIndicator {
   }
 
   /**
-   * One-line "what's happening right now" footer for the streaming branch.
-   * Returns '' when the model is actively emitting reply text (the live tail
-   * is already changing, so a footer would just add noise); otherwise shows
-   * the latest tool call or a "thinking" marker so the message text differs
-   * on each new step and the edit re-fires instead of freezing.
+   * "Recent activity" footer for the streaming branch: up to `this.trailLines`
+   * most-recent activity lines (💭 reasoning / 🔧 tool + args) taken from the
+   * tail of the trail, oldest first, each tail-truncated to `perBlockChars`.
+   *
+   * The footer is shown even while the model is actively emitting reply text —
+   * the reply tail already changes, but the user asked for a persistent 2-3 line
+   * trail here so they can still watch tool calls / thinking scroll underneath.
+   * It always shows the NEWEST activity (a live "thinking…" line when no block
+   * is recorded yet, or a 🔧 line for the latest tool) so the message text
+   * differs on each new step and the edit re-fires instead of freezing.
    */
-  _latestActivityLine() {
-    if (this.lastActivityKind === 'text' || this.lastActivityKind === null) return '';
-    let line;
-    if (this.lastActivityKind === 'tool') {
-      line = '🔧 ' + (this.lastActivityName || 'tool');
-    } else {
-      line = '💭 思考中…';
+  _latestActivityLines() {
+    const n = this.trailLines;
+    if (!n) return '';
+    const per = this.o.perBlockChars ?? 240;
+    const lines = [];
+    // Newest block first; render oldest→newest below.
+    for (let i = this.trace.length - 1; i >= 0 && lines.length < n; i--) {
+      const b = this.trace[i];
+      if (b.kind === 'reasoning') {
+        const t = compactText(b.text);
+        if (t) lines.push('💭 ' + tailOf(t, per));
+      } else {
+        const arg = summarizeToolArgs(b.args, per);
+        lines.push('🔧 ' + b.name + (arg ? '：' + arg : ''));
+      }
     }
-    // Keep the footer to a single short line so it never balloons the message.
-    if (line.length > 60) line = line.slice(0, 59) + '…';
-    return '\n' + line + ' …';
+    lines.reverse();
+    // No activity blocks yet: fall back to the live one-liner so the footer is
+    // never empty before the first reasoning/tool event lands.
+    if (!lines.length) {
+      if (this.lastActivityKind === 'tool') lines.push('🔧 ' + (this.lastActivityName || 'tool'));
+      else if (this.lastActivityKind === 'reasoning') lines.push('💭 思考中…');
+      else return '';
+    }
+    const headerLine = n > 1 ? '最近活动（最新）：' : '最近活动：';
+    let inner = headerLine + '\n' + lines.join('\n');
+    // Safety net: the per-line caps already bound this, but a pathologically
+    // long tool name could still overshoot — drop OLDEST lines to fit.
+    const budget = n * (per + 8) + 16;
+    if (inner.length > budget) {
+      while (lines.length > 1 && inner.length > budget) {
+        lines.shift();
+        inner = headerLine + '\n' + lines.join('\n');
+      }
+    }
+    return '\n' + inner;
   }
 
   /** Post the indicator message (once); returns its id or null. */

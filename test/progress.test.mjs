@@ -253,6 +253,69 @@ await test('streaming reply is tail-truncated to maxChars', () => {
   const body = text.replace('💬 回复（生成中）\n', '');
   assert.ok(body.length <= 11, `body too long: ${body.length}`);
 });
+// ---- streaming footer: recent-activity trail (2-3 lines, v0.6.3) ------------
+console.log('\nstreaming footer (最近活动 trail):');
+await test('shows up to trailLines recent activities, oldest first, newest last', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, trailLines: 3, perBlockChars: 20 }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'reasoning-delta', text: 'step one thinking' } } });
+  ind.processEvent({ seq: 2, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la /home/user/projects"}', callId: 'c1' } });
+  ind.processEvent({ seq: 3, type: 'tool/call', data: { name: 'read', arguments: 'file.txt', callId: 'c2' } });
+  ind.processEvent({ seq: 4, type: 'tool/call', data: { name: 'grep', arguments: 'pattern', callId: 'c3' } });
+  ind.processEvent({ seq: 5, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'Here is the answer.' } } });
+  const text = ind.buildTraceText();
+  assert.ok(text.includes('最近活动（最新）：'), text);
+  // Only the 3 NEWEST blocks (bash/read/grep) appear; step-one thinking dropped.
+  assert.ok(text.includes('🔧 bash'), text);
+  assert.ok(text.includes('🔧 read'), text);
+  assert.ok(text.includes('🔧 grep'), text);
+  assert.ok(!text.includes('step one thinking'), 'older activity beyond trailLines must drop');
+  // Order: oldest of the window first, newest last (grep right before the reply? no — reply is the body; footer follows body).
+  const foot = text.slice(text.indexOf('最近活动'));
+  assert.ok(foot.indexOf('🔧 bash') < foot.indexOf('🔧 read'), foot);
+  assert.ok(foot.indexOf('🔧 read') < foot.indexOf('🔧 grep'), foot);
+});
+await test('footer visible while model is emitting text (persistent trail)', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, trailLines: 2 }));
+  ind.processEvent({ seq: 1, type: 'tool/call', data: { name: 'bash', arguments: 'ls', callId: 'c1' } });
+  // text-delta sets lastActivityKind='text' — the OLD footer hid then; the new one stays.
+  ind.processEvent({ seq: 2, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'reply body…' } } });
+  const text = ind.buildTraceText();
+  assert.ok(text.includes('🔧 bash'), `footer must survive during text emission: ${text}`);
+});
+await test('trailLines: 1 falls back to the old single-line behavior', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, trailLines: 1 }));
+  ind.processEvent({ seq: 1, type: 'tool/call', data: { name: 'bash', arguments: 'ls', callId: 'c1' } });
+  ind.processEvent({ seq: 2, type: 'tool/call', data: { name: 'grep', arguments: 'x', callId: 'c2' } });
+  ind.processEvent({ seq: 3, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'hi' } } });
+  const text = ind.buildTraceText();
+  assert.ok(text.includes('最近活动：'), text);
+  assert.ok(!text.includes('（最新）'), 'single line uses the plain header');
+  assert.ok(text.includes('🔧 grep'), text);
+  assert.ok(!text.includes('🔧 bash'), 'only the newest line survives');
+});
+await test('trailLines: 0 disables the footer entirely', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, trailLines: 0 }));
+  ind.processEvent({ seq: 1, type: 'tool/call', data: { name: 'bash', arguments: 'ls', callId: 'c1' } });
+  ind.processEvent({ seq: 2, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'hi' } } });
+  const text = ind.buildTraceText();
+  assert.ok(!text.includes('最近活动'), text);
+});
+await test('no footer when model emits text with no prior activity', () => {
+  // Pure text reply, no tools/thinking yet — nothing to show under the reply.
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, trailLines: 3 }));
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'ans' } } });
+  const text = ind.buildTraceText();
+  assert.ok(!text.includes('最近活动'), text);
+  assert.ok(text.includes('ans'), text);
+});
+await test('footer lines are tail-truncated to perBlockChars', () => {
+  const ind = new ProgressIndicator(makeOpts({ streaming: true, trailLines: 2, perBlockChars: 8 }));
+  ind.processEvent({ seq: 1, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls -la /home/lovedheart/Documents/projects/very-long-path-here"}', callId: 'c1' } });
+  ind.processEvent({ seq: 2, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'ans' } } });
+  const foot = ind.buildTraceText().slice(ind.buildTraceText().indexOf('最近活动'));
+  const line = foot.split('\n')[1];
+  assert.ok(line.length <= 8 + 12, `tool line must stay short, got ${line.length}: ${line}`);
+});
 await test('assistant/message captures the authoritative final text', () => {
   const ind = new ProgressIndicator(makeOpts({ streaming: true }));
   ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'partial' } } });
