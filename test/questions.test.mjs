@@ -62,7 +62,7 @@ function makeModule({ ownership, failSend, isAutopilot, autopilotWindowMs = 0, a
     log: () => {},
     escape: (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
     client,
-    ownership: ownership ?? ((sid) => (typeof sid === 'string' && sid.startsWith('telegram-') ? { chatId: '123', threadId: null } : null)),
+    ownership: ownership ?? ((sid) => (typeof sid === 'string' && sid.startsWith('telegram-') ? { chatId: '123', botId: 'a', threadId: null } : null)),
     respond: async (body) => {
       state.responses.push(body);
       return { accepted: true };
@@ -408,7 +408,7 @@ await test('option tap answers with the selected label and settles the card', as
 await test('plain-text reply is consumed as a custom answer (single question)', async () => {
   const { mod, client, state } = makeModule();
   await request(mod, client, 'rpc-2', 'telegram-abc', [singleQ]);
-  const consumed = mod.consumeTextReply('123', '我想用 Go');
+  const consumed = mod.consumeTextReply('123', 'a', '我想用 Go');
   assert.equal(consumed, true);
   await sleep(1);
   assert.equal(state.responses.length, 1);
@@ -422,13 +422,13 @@ await test('plain-text reply is NOT consumed for a multi-question card', async (
     { id: 'a', question: '一？', options: [{ label: 'A' }] },
     { id: 'b', question: '二？', options: [{ label: 'B' }] },
   ]);
-  assert.equal(mod.consumeTextReply('123', '随便'), false);
+  assert.equal(mod.consumeTextReply('123', 'a', '随便'), false);
   assert.equal(state.responses.length, 0);
 });
 
 await test('plain-text reply is NOT consumed when no card is pending', async () => {
   const { mod, state } = makeModule();
-  assert.equal(mod.consumeTextReply('123', 'hi'), false);
+  assert.equal(mod.consumeTextReply('123', 'a', 'hi'), false);
   assert.equal(state.responses.length, 0);
 });
 

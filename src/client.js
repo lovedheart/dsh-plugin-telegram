@@ -314,7 +314,10 @@ export class TelegramClient {
     };
   }
 
-  async editMessageText(chatId, messageId, text, parseMode, replyMarkup) {
+  // `opts` (6th arg) is a plugin-internal routing hint for multi-bot: its
+  // `botId` tells clientDispatch WHICH bot client to call. It is NEVER part of
+  // the Telegram Bot API body (constructed below from explicit fields only).
+  async editMessageText(chatId, messageId, text, parseMode, replyMarkup, opts) {
     try {
       const body = {
         chat_id: String(chatId),

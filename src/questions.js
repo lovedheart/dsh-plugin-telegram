@@ -348,7 +348,7 @@ async function sendWithRetry(sendFn, log) {
  * deps: {
  *   log(level, ...), escape(s),
  *   client — TelegramClient (sendMessage/editMessageText/answerCallbackQuery),
- *   ownership(sessionId) -> { chatId, threadId } | null   (index.js policy),
+ *   ownership(sessionId) -> { chatId, botId, threadId } | null   (index.js policy),
  *   respond(body) -> Promise<{accepted: bool, reason?}>   (POST /api/respond),
  * }
  *
@@ -380,7 +380,7 @@ export function createQuestionModule(deps) {
     const edit = (mid, text, kb) => {
       if (!mid) return;
       Promise.resolve()
-        .then(() => deps.client.editMessageText(entry.chatId, mid, text, 'HTML', kb ? { inline_keyboard: kb } : undefined))
+        .then(() => deps.client.editMessageText(entry.chatId, mid, text, 'HTML', kb ? { inline_keyboard: kb } : undefined, { botId: entry.botId }))
         .catch(() => { /* card may already be gone */ });
     };
     const subKey = (kb) => kb.map((row) =>
@@ -536,7 +536,7 @@ export function createQuestionModule(deps) {
     }
     entry.autopilot = true;
     const send = (text, kb) => deps.client.sendMessage({
-      chatId: entry.chatId, text, parseMode: 'HTML',
+      chatId: entry.chatId, botId: entry.botId ?? undefined, text, parseMode: 'HTML',
       messageThreadId: entry.threadId,
       replyMarkup: { inline_keyboard: autopilotSubKey(kb, entry.key) },
       disableNotification: false,
@@ -582,11 +582,13 @@ export function createQuestionModule(deps) {
   // answering (re-render the normal interactive card). Does NOT cancel the ask.
   async function autopilotTakeover(entry) {
     clearTimeout(entry.autopilotTimer); entry.autopilotTimer = undefined;
-    try { deps.autopilotTakeover?.(entry.chatId); } catch { /* ignore */ }
+    // v0.6.2: pass the owning bot so takeover disables autopilot for EXACTLY
+    // this (bot, chat), not any bot sharing the same numeric chatId.
+    try { deps.autopilotTakeover?.(entry.chatId, entry.botId); } catch { /* ignore */ }
     entry.autopilot = false;
     const send = (mid, text, kb) => {
       if (!mid) return;
-      deps.client.editMessageText(entry.chatId, mid, text, 'HTML', { inline_keyboard: autopilotSubKey(kb, entry.key) }).catch(() => {});
+      deps.client.editMessageText(entry.chatId, mid, text, 'HTML', { inline_keyboard: autopilotSubKey(kb, entry.key) }, { botId: entry.botId }).catch(() => {});
     };
     if (entry.questions.length === 1) {
       const { text, keyboard } = buildQuestionCard(entry.questions, deps.escape, entry.selections);
@@ -641,6 +643,7 @@ export function createQuestionModule(deps) {
       sessionId,
       questions,
       chatId: own.chatId,
+      botId: own.botId ?? null, // v0.6.2: owning bot (per-(bot,chat) state)
       threadId: own.threadId ?? null,
       cardMessageIds: [],    // one per question (single-question flow: length 1)
       summaryMessageId: null, // progress card (multi-question flows only)
@@ -654,17 +657,20 @@ export function createQuestionModule(deps) {
         row.map((b) => ({ ...b, callback_data: b.callback_data.replace('KEY', key) })));
       const send = async (text, kb) => sendWithRetry(() => deps.client.sendMessage({
         chatId: entry.chatId,
+        botId: entry.botId ?? undefined,
         text,
         parseMode: 'HTML',
         messageThreadId: entry.threadId,
         replyMarkup: { inline_keyboard: subKey(kb) },
         disableNotification: false,
       }), deps.log);
-      // Autopilot (v0.5.0): when this chat is in autopilot mode, auto-adopt the
-      // recommended option and schedule the commit instead of waiting for a
+      // Autopilot (v0.5.0): when this (bot, chat) is in autopilot mode, auto-adopt
+      // the recommended option and schedule the commit instead of waiting for a
       // tap. Returns true when it handled the question (autopilot card posted +
       // timer scheduled) — we then skip the normal interactive flow below.
-      if (deps.isAutopilot?.(own.chatId)) {
+      // v0.6.2: keyed by the owning bot so a shared chat does not auto-adopt on
+      // the strength of another bot's autopilot.
+      if (deps.isAutopilot?.(own.chatId, own.botId)) {
         const adopted = await autopilotAdopt(entry);
         if (adopted) return;
         // autopilotAdopt returned false (no auto-pickable option or card send
@@ -726,7 +732,7 @@ export function createQuestionModule(deps) {
       row.map((b) => ({ ...b, callback_data: b.callback_data.replace('KEY', entry.key) })));
     const edit = (mid, text, kb) => {
       if (!mid) return;
-      deps.client.editMessageText(entry.chatId, mid, text, 'HTML', { inline_keyboard: subKey(kb) }).catch(() => {});
+      deps.client.editMessageText(entry.chatId, mid, text, 'HTML', { inline_keyboard: subKey(kb) }, { botId: entry.botId }).catch(() => {});
     };
     if (entry.questions.length === 1) {
       const { text, keyboard } = buildQuestionCard(entry.questions, deps.escape, entry.selections);
@@ -815,15 +821,25 @@ export function createQuestionModule(deps) {
    * Consume a plain-text Telegram reply as a custom answer. Only valid while
    * exactly one single-or-multi question card is pending for that chat and the
    * text is not empty. Returns true when consumed.
+   *
+   * v0.6.2: `botId` (second arg) scopes the match to a (bot, chat). When a
+   * non-null botId is present, a reply to bot B is NOT consumed as bot A's
+   * pending card even in a shared chat. When botId is null/undefined, it
+   * matches by chatId alone (legacy single-bot behavior).
+   *
+   * @param {string} chatId
+   * @param {string|null} [botId] owning bot, or null to match any bot in the chat
+   * @param {string} text
    */
-  function consumeTextReply(chatId, text) {
+  function consumeTextReply(chatId, botId, text) {
     const t = String(text || '').trim();
     if (!t) return false;
     const chatKey = String(chatId);
-    // Most recent pending card for this chat.
+    const botKey = botId != null ? String(botId) : null;
+    // Most recent pending card for this (bot, chat).
     let entry = null;
     for (const p of [...pending.values()].reverse()) {
-      if (String(p.chatId) === chatKey) { entry = p; break; }
+      if (String(p.chatId) === chatKey && (botKey === null || String(p.botId) === botKey)) { entry = p; break; }
     }
     if (!entry || entry.outcome || entry.questions.length !== 1) return false;
     void answer(entry, { custom: { id: entry.questions[0].id, text: t } });

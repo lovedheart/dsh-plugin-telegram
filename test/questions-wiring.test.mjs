@@ -226,9 +226,13 @@ await atest('multi-bot: tapping 提交 acks on the owning bot (clientDispatch ro
     const submitData = submitBtn.callback_data;
     // Drive the tap through the REAL registered poller callback handler (the
     // production wrapper that sets the active-card bot then calls the module).
-    const pa = botRegistry.get('alice').poller; // firstBotId = alice (main poller)
-    const cbHandler = pa.callbackHandlers[0];
-    assert.ok(cbHandler, 'a callback handler is registered on the main poller');
+    // Production-faithful: each bot long-polls its OWN token, so a tap on a card
+    // posted by bob arrives via BOB's poller (source bot = bob). The wrapper
+    // must route the ack to the SOURCE bot — not to whichever bot registered the
+    // chat first (alice, in this shared-chat setup).
+    const pb = botRegistry.get('bob').poller; // owning bot = bob
+    const cbHandler = pb?.callbackHandlers?.[0];
+    assert.ok(cbHandler, 'a callback handler is registered on the owning (bob) poller');
     await cbHandler({
       id: 'cb-mb-1',
       from: { id: 'u2', username: 'u2' },
