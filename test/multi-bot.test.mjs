@@ -867,8 +867,10 @@ await atest('T27 telegram_get_info lists ALL bots (2 -> len 2, each {id,username
   const s = await toolSetup();
   try {
     const getInfo = toolBy(s.tools, 'telegram_get_info');
-    const list = await getInfo.execute({}, {});
-    assert.ok(Array.isArray(list), 'get_info returns an array (host renders as JSON)');
+    const raw = await getInfo.execute({}, {});
+    assert.ok(typeof raw === 'string', 'get_info returns a JSON string (dsh 0.1.1 tool-output contract)');
+    const list = JSON.parse(raw);
+    assert.ok(Array.isArray(list), 'parsed get_info result is an array');
     assert.equal(list.length, 2, 'two bots -> two entries');
     const byId = new Map(list.map((e) => [e.id, e]));
     assert.ok(byId.has('alice') && byId.has('bob'), 'entries keyed by bot id alice + bob');
@@ -896,7 +898,9 @@ await atest('T27 telegram_get_info lists ALL bots (2 -> len 2, each {id,username
     }));
     await waitMe('default');
     const tools = new Map(registered.map((t) => [t.name, t]));
-    const list = await tools.get('telegram_get_info').execute({}, {});
+    const rawSingle = await tools.get('telegram_get_info').execute({}, {});
+    assert.ok(typeof rawSingle === 'string', 'get_info returns a JSON string (single-bot)');
+    const list = JSON.parse(rawSingle);
     assert.ok(Array.isArray(list) && list.length === 1, 'single bot -> exactly 1 entry');
     assert.equal(list[0].id, 'default', 'single-bot entry id is "default"');
     assert.equal(list[0].username, 'legacy', 'single-bot entry username from getMe');
