@@ -55,7 +55,7 @@ function makeClient(overrides = {}) {
  * Build a question module wired to a mock client + ownership + responder.
  * Returns the module and a handle to inspect what was posted/responded.
  */
-function makeModule({ ownership, failSend, isAutopilot, autopilotWindowMs = 0, autopilotTakeover } = {}) {
+function makeModule({ ownership, failSend, isAutopilot, autopilotWindowMs = 0, autopilotTakeover, timeoutMs = 0 } = {}) {
   const client = makeClient({ failSend });
   const state = { responses: [] };
   const deps = {
@@ -67,6 +67,7 @@ function makeModule({ ownership, failSend, isAutopilot, autopilotWindowMs = 0, a
       state.responses.push(body);
       return { accepted: true };
     },
+    timeoutMs,
   };
   if (typeof isAutopilot === 'function') {
     deps.isAutopilot = isAutopilot;
@@ -702,6 +703,48 @@ await test('stale callback (unknown/expired key) acks but does not respond', asy
   await sleep(1);
   assert.equal(state.responses.length, 0);
   assert.ok(client.calls.acks.some((a) => a.text.includes('已过期')));
+});
+
+// ---------------------------------------------------------------------------
+// Auto-cancel timeout (questionsTimeoutSec)
+// ---------------------------------------------------------------------------
+console.log('\ncreateQuestionModule: auto-cancel timeout');
+await test('timeoutMs>0: card auto-cancels after timeout, card settles with ⏰ label', async () => {
+  const { mod, client, state } = makeModule({ timeoutMs: 1000 });
+  const kb = await request(mod, client, 'rpc-to1', 'telegram-abc', [singleQ]);
+  // Posted card shows the timeout hint.
+  assert.ok(client.calls.sends[0].text.includes('⏰ 1 秒后自动取消'), `card text: ${client.calls.sends[0].text}`);
+  await sleep(1500);
+  // Timed out: respond called with cancelled, card settled.
+  assert.equal(state.responses.length, 1);
+  assert.equal(state.responses[0].result.ok, false);
+  assert.equal(state.responses[0].result.error.code, 'cancelled');
+  assert.ok(client.calls.edits.some((e) => e.text.includes('⏰ 已超时自动取消')));
+});
+
+await test('timeoutMs=0: no auto-cancel (default behaviour unchanged)', async () => {
+  const { mod, client, state } = makeModule({ timeoutMs: 0 });
+  await request(mod, client, 'rpc-to2', 'telegram-abc', [singleQ]);
+  await sleep(50);
+  assert.equal(state.responses.length, 0);
+  assert.ok(!client.calls.sends[0].text.includes('自动取消'), 'no timeout hint when disabled');
+});
+
+await test('answering before timeout clears the timer (no late auto-cancel)', async () => {
+  const { mod, client, state } = makeModule({ timeoutMs: 80 });
+  const kb = await request(mod, client, 'rpc-to3', 'telegram-abc', [singleQ]);
+  await mod.handleCallbackQuery({ id: 'to3', data: btn(kb, ':q0:0').callback_data });
+  await sleep(150); // past the timeout
+  assert.equal(state.responses.length, 1, 'exactly one response (the tap)');
+  assert.equal(state.responses[0].result.ok, true);
+});
+
+await test('cancelAll clears pending timeout timers', async () => {
+  const { mod, client, state } = makeModule({ timeoutMs: 60 });
+  await request(mod, client, 'rpc-to4', 'telegram-abc', [singleQ]);
+  mod.cancelAll();
+  await sleep(150);
+  assert.equal(state.responses.length, 0, 'no auto-cancel after cancelAll');
 });
 
 await test('cancelAll on unload forgets pending cards without network', async () => {

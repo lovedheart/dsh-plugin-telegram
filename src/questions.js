@@ -205,6 +205,7 @@ function settleStatusLine(esc, settled, chosen) {
     return what ? `🔒 已提交：${what}` : '🔒 已提交';
   }
   if (settled.outcome === 'cancelled') return '⌛ 已取消';
+  if (settled.outcome === 'timeout') return '⏰ 已超时自动取消';
   if (settled.outcome === 'rejected') return '⚠️ 提交被拒绝，请重新提问';
   return '🔒 已作答';
 }
@@ -217,7 +218,7 @@ function settleStatusLine(esc, settled, chosen) {
  * adaptive option rows, then [✅ 提交] (only when multi-select) + [❌ 取消].
  * A plain-text reply to this card is consumed as a custom answer.
  */
-export function buildQuestionCard(questions, escape, selections = new Map(), settled = null) {
+export function buildQuestionCard(questions, escape, selections = new Map(), settled = null, timeoutSec = 0) {
   const esc = escape || ((s) => String(s ?? ''));
   const q = questions[0];
   const parts = ['❓ 需要你回答'];
@@ -247,6 +248,7 @@ export function buildQuestionCard(questions, escape, selections = new Map(), set
     finalRow.push({ text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` });
     keyboard.push(finalRow);
     parts.push('', '💬 也可以直接回复这条消息输入你的答案。');
+    if (timeoutSec > 0) parts.push('', `<i>⏰ ${timeoutSec} 秒后自动取消</i>`);
   }
   return { text: joinLines(parts), keyboard };
 }
@@ -260,7 +262,7 @@ export function buildQuestionCard(questions, escape, selections = new Map(), set
  * per-question lock button (✅ 提交本题); the shared 🏁 提交全部 lives on the
  * summary card (buildSummaryCard).
  */
-export function buildQuestionCardFor(q, qi, total, escape, selections = new Map(), locked = new Set(), settled = null) {
+export function buildQuestionCardFor(q, qi, total, escape, selections = new Map(), locked = new Set(), settled = null, timeoutSec = 0) {
   const esc = escape || ((s) => String(s ?? ''));
   const isLocked = locked.has(q.id);
   const parts = [`❓ 需要你回答（${qi + 1}/${total}）`];
@@ -284,6 +286,7 @@ export function buildQuestionCardFor(q, qi, total, escape, selections = new Map(
   } else {
     parts.push(chosen.length ? `🔘 已选：${esc(chosen.join('，'))}` : '🔘 未选择');
     keyboard.push([{ text: '✅ 提交本题', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:lock:q${qi}` }, { text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` }]);
+    if (timeoutSec > 0) parts.push('', `<i>⏰ ${timeoutSec} 秒后自动取消</i>`);
   }
   return { text: joinLines(parts), keyboard };
 }
@@ -294,7 +297,7 @@ export function buildQuestionCardFor(q, qi, total, escape, selections = new Map(
  * Its 🏁 提交全部 button submits whatever has been selected so far —
  * unanswered questions go back empty (skipped).
  */
-export function buildSummaryCard(entry, escape, settled = null) {
+export function buildSummaryCard(entry, escape, settled = null, timeoutSec = 0) {
   const esc = escape || ((s) => String(s ?? ''));
   const total = entry.questions.length;
   const done = entry.questions.filter((q) => entry.locked.has(q.id)).length;
@@ -317,6 +320,7 @@ export function buildSummaryCard(entry, escape, settled = null) {
     parts.push(`${entry.locked.has(q.id) ? '✅' : '⬜'} ${esc(q.header || `第${qi + 1}题`)}`);
   });
   parts.push('', '💬 逐题点「✅ 提交本题」确认；完成后点「🏁 提交全部」交卷。');
+  if (timeoutSec > 0) parts.push(`<i>⏰ ${timeoutSec} 秒后自动取消</i>`);
   const keyboard = [[
     { text: '🏁 提交全部', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:submit` },
     { text: '❌ 取消', callback_data: `${QUESTION_CALLBACK_PREFIX}KEY:cancel` },
@@ -350,6 +354,8 @@ async function sendWithRetry(sendFn, log) {
  *   client — TelegramClient (sendMessage/editMessageText/answerCallbackQuery),
  *   ownership(sessionId) -> { chatId, botId, threadId } | null   (index.js policy),
  *   respond(body) -> Promise<{accepted: bool, reason?}>   (POST /api/respond),
+ *   timeoutMs — 0 = no expiry (default); >0 auto-cancels the card after this
+ *     long without a tap (→ cancelled, agent turn unblocks).
  * }
  *
  * Returns { handleFrame, handleCallbackQuery, consumeTextReply, cancelAll }.
@@ -365,6 +371,7 @@ export function createQuestionModule(deps) {
   function settle(entry, outcome, note) {
     if (entry.outcome) return;
     entry.outcome = outcome;
+    if (entry.timeoutTimer) { clearTimeout(entry.timeoutTimer); entry.timeoutTimer = undefined; }
     pending.delete(entry.key);
     // Forget the rpcId so a future (re-asked) question with the same id — which
     // DSH mints fresh per ask, but a reconnect replay could re-deliver — still
@@ -399,7 +406,7 @@ export function createQuestionModule(deps) {
   }
 
   /** Submit answers (or a cancel) for one pending entry; settles the card. */
-  async function answer(entry, { answers, custom, cancel } = {}) {
+  async function answer(entry, { answers, custom, cancel, timeout } = {}) {
     let body;
     if (cancel) {
       body = {
@@ -463,7 +470,7 @@ export function createQuestionModule(deps) {
       const note = custom
         ? custom.text.slice(0, 60)
         : answersNote(entry);
-      settle(entry, cancel ? 'cancelled' : 'answered', cancel ? undefined : note);
+      settle(entry, cancel ? (timeout ? 'timeout' : 'cancelled') : 'answered', cancel ? undefined : note);
       return true;
     }
     // not-pending: the web UI answered first (first answer wins). Anything else
@@ -650,6 +657,7 @@ export function createQuestionModule(deps) {
       selections: new Map(),
       locked: new Set(),     // question ids confirmed via 提交本题
       outcome: null,
+      timeoutTimer: undefined,
     };
     pending.set(key, entry);
     void (async () => {
@@ -677,23 +685,33 @@ export function createQuestionModule(deps) {
         // failed) — fall through to the normal interactive card.
       }
       try {
+        const timeoutSec = Math.round((Number(deps.timeoutMs) || 0) / 1000);
         if (questions.length === 1) {
-          const { text, keyboard } = buildQuestionCard(questions, deps.escape, entry.selections);
+          const { text, keyboard } = buildQuestionCard(questions, deps.escape, entry.selections, null, timeoutSec);
           const res = await send(text, keyboard);
           entry.cardMessageIds = [res?.messageId ?? null];
         } else {
           // One message per question so each question's options sit directly
           // under its own text, then a progress card with the final submit.
           for (let qi = 0; qi < questions.length; qi++) {
-            const { text, keyboard } = buildQuestionCardFor(questions[qi], qi, questions.length, deps.escape, entry.selections, entry.locked);
+            const { text, keyboard } = buildQuestionCardFor(questions[qi], qi, questions.length, deps.escape, entry.selections, entry.locked, null, timeoutSec);
             const res = await send(text, keyboard);
             entry.cardMessageIds.push(res?.messageId ?? null);
           }
-          const s = buildSummaryCard(entry, deps.escape);
+          const s = buildSummaryCard(entry, deps.escape, null, timeoutSec);
           const resS = await send(s.text, s.keyboard);
           entry.summaryMessageId = resS?.messageId ?? null;
         }
         deps.log?.('info', `Question card(s) posted for ${sessionId} (chat ${entry.chatId}, ${questions.length} question(s))`);
+        // Auto-cancel after timeoutMs without a tap (0 = no cap).
+        if (Number(deps.timeoutMs) > 0 && !entry.outcome) {
+          entry.timeoutTimer = setTimeout(() => {
+            entry.timeoutTimer = undefined;
+            if (entry.outcome) return;
+            deps.log?.('info', `Question card for ${sessionId} timed out after ${deps.timeoutMs}ms — auto-cancelling`);
+            void answer(entry, { cancel: true, timeout: true });
+          }, deps.timeoutMs);
+        }
       } catch (err) {
         // Card delivery failed — do NOT claim: the web UI can still answer, and
         // a later replay of this rpcId may still be able to post.
@@ -851,6 +869,7 @@ export function createQuestionModule(deps) {
     for (const entry of [...pending.values()]) {
       if (!entry.outcome) {
         entry.outcome = 'cancelled';
+        if (entry.timeoutTimer) { clearTimeout(entry.timeoutTimer); entry.timeoutTimer = undefined; }
         pending.delete(entry.key);
       }
     }

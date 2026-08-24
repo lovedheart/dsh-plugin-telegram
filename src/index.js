@@ -165,6 +165,10 @@ const defaults = {
   // approvalForDefaultAgent (default true, only when defaultChatId is set).
   questionsEnabled: true,
   questionsForDefaultAgent: true,
+  // Bound how long a question card waits for a tap before auto-cancelling
+  // (→ 'cancelled', agent turn unblocks). 0 disables the cap (wait forever).
+  // Mirrors approvalTimeoutSec.
+  questionsTimeoutSec: 1800,
   // Autopilot (v0.5.0). A per-chat ON/OFF mode that makes the chat's agent run
   // "fully autonomous". While active it does two things:
   //   1. Global permissions — appends a `sandbox/mode` = autopilotSandboxMode
@@ -265,6 +269,7 @@ const schema = {
   approvalAlwaysPath: ['string'],
   questionsEnabled: ['boolean'],
   questionsForDefaultAgent: ['boolean'],
+  questionsTimeoutSec: ['number'],
   autopilotEnabled: ['boolean'],
   autopilotSandboxMode: ['string'],
   autopilotWindowMs: ['number'],
@@ -698,6 +703,7 @@ export async function apply(ctx, config) {
   // so its questions must also reach the phone by default.
   const questionsEnabled = c.questionsEnabled !== false;
   const questionsForDefaultAgent = c.questionsForDefaultAgent !== false;
+  const questionsTimeoutMs = Math.max(0, Number(c.questionsTimeoutSec) || 0) * 1000;
   const webUrl =
     (typeof c.webUrl === 'string' && c.webUrl.trim() ? c.webUrl.trim()
       : process.env.DSH_WEB_URL || '') || 'http://127.0.0.1:3080';
@@ -3661,6 +3667,8 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
         client: moduleClient,
         ownership: (sessionId) => telegramAgentOwnership(sessionId, { allowDefault: questionsForDefaultAgent }),
         respond: respondQuestion,
+        // Auto-cancel a question card after this long without a tap (0 = no cap).
+        timeoutMs: questionsTimeoutMs,
         // Autopilot (v0.5.0): auto-adopt the recommended option when the owning
         // chat is in autopilot mode, then commit after the takeover window.
         isAutopilot: (chatId, botId) => isAutopilotChat(chatId, botId),
