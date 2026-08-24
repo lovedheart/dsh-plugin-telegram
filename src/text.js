@@ -92,12 +92,55 @@ export function chunkText(text, maxSize) {
 // &, <, >).
 // ---------------------------------------------------------------------------
 
+/**
+ * Wrap GFM tables in code fences so the fence rule renders them as <pre>
+ * (monospaced, pipe layout preserved) instead of sending raw pipe lines
+ * that Telegram displays as plain unformatted text.
+ *
+ * Minimal detection: a line containing `|` immediately followed by a
+ * separator line (only `-`, `|`, `:`, whitespace; must contain `-` and `|`)
+ * starts a table; the table ends at the first line not starting with `|`.
+ * Lines inside existing ``` fences are never touched.
+ */
+function fenceGfmTables(text) {
+  const isSeparator = (l) =>
+    l.includes('-') && l.includes('|') && !/[^\s:|-]/.test(l);
+  const lines = text.split('\n');
+  const out = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*```/.test(lines[i])) {
+      inFence = !inFence;
+      out.push(lines[i]);
+      continue;
+    }
+    if (inFence) {
+      out.push(lines[i]);
+      continue;
+    }
+    const isHeader =
+      lines[i].includes('|') && i + 1 < lines.length && isSeparator(lines[i + 1]);
+    if (!isHeader) {
+      out.push(lines[i]);
+      continue;
+    }
+    const start = i;
+    i += 2; // header + separator
+    while (i < lines.length && /^\s*\|/.test(lines[i])) i++;
+    out.push('```\n' + lines.slice(start, i).join('\n') + '\n```');
+  }
+  return out.join('\n');
+}
+
 export function markdownToTelegramHtml(md) {
   const hasBacktick = md.includes('`');
   let text = md
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+
+  // GFM tables -> code fences (rendered as <pre> by the next rule).
+  text = fenceGfmTables(text);
 
   text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, __, code) => `<pre>${code.trim()}</pre>`);
   text = text.replace(/`([^`]+)`/g, '<code>$1</code>');

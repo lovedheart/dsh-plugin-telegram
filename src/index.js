@@ -1056,6 +1056,13 @@ export async function apply(ctx, config) {
     const chunks = chunkText(rawText, maxMessageLength);
     if (chunks.length === 0) return [];
 
+    // Defensive: raw HTML tags mixed into markdown text get escaped to
+    // literal text by the converter (a stray `<b>` shows up verbatim).
+    // Warn once so the author notices — use markdown (e.g. **bold**) instead.
+    if (doConvert && /<\/?[a-zA-Z][^>]*>/.test(rawText)) {
+      log('warn', `sendText: raw HTML tag in markdown text for chat ${chatId} will render as literal text; use markdown (e.g. **bold**) instead`);
+    }
+
     const sent = [];
     for (let i = 0; i < chunks.length; i++) {
       let finalText = chunks[i];

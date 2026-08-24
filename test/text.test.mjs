@@ -38,6 +38,29 @@ test('fenced block to <pre>', () => {
   const out = markdownToTelegramHtml('```\nlet x = 1\n```');
   assert.ok(out.includes('<pre>let x = 1</pre>'));
 });
+test('GFM table fenced into <pre> (readable, not raw pipes)', () => {
+  const md = 'intro\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\noutro';
+  const out = markdownToTelegramHtml(md);
+  assert.ok(out.includes('<pre>| A | B |\n|---|---|\n| 1 | 2 |</pre>'), 'table in pre: ' + out);
+  assert.ok(out.includes('intro') && out.includes('outro'));
+});
+test('table without header row (separator on line 1) still fenced', () => {
+  const md = '| a | b |\n|---|---|\n| 1 | 2 |';
+  const out = markdownToTelegramHtml(md);
+  assert.ok(out.includes('<pre>| a | b |'), out);
+});
+test('table inside existing code fence is NOT double-fenced', () => {
+  const md = '```\n| a | b |\n|---|---|\n```\nplain';
+  const out = markdownToTelegramHtml(md);
+  const preCount = (out.match(/<pre>/g) || []).length;
+  assert.equal(preCount, 1, 'exactly one <pre>: ' + out);
+  assert.ok(out.includes('| a | b |'), out);
+});
+test('pipe in a plain line without separator is left alone', () => {
+  const out = markdownToTelegramHtml('a | b and c | d\nno table here');
+  assert.ok(!out.includes('<pre>'), out);
+  assert.ok(out.includes('a | b and c | d'), out);
+});
 
 console.log('chunkText:');
 test('short -> single chunk', () => {
