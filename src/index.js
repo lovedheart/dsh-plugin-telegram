@@ -1114,6 +1114,21 @@ export async function apply(ctx, config) {
     return sent;
   }
 
+  // Session event-log accessor compatible with both dsh-session APIs:
+  //   • ≤ 0.1.1-rc.x: `session.events` getter (frozen snapshot of the log)
+  //   • 0.1.2-rc.1+:  the getter was REMOVED; `session.snapshotEvents()` is
+  //     the equivalent (same content, same snapshot-until-next-append
+  //     semantics). Reading `.events` on the new class yields undefined,
+  //     which silently killed reply delivery — hence this indirection.
+  function sessionEvents(session) {
+    if (!session) return undefined;
+    if (Array.isArray(session.events)) return session.events;
+    if (typeof session.snapshotEvents === 'function') {
+      try { return session.snapshotEvents(); } catch { return undefined; }
+    }
+    return undefined;
+  }
+
   // Extract the plain text of an assistant message event (data.message).
   function textOfAssistantMessage(evt) {
     const msg = evt?.data?.message;
@@ -1135,7 +1150,7 @@ export async function apply(ctx, config) {
   async function watchDirectReply(agent, botId, chatId, telegramMessageId) {
     try {
       const session = agent.session;
-      const baseline = session && Array.isArray(session.events) ? session.events.length : 0;
+      const baseline = sessionEvents(session)?.length ?? 0;
 
       // 1) Let the turn finish — busy-aware wait:
       //    • while the agent is `running`, keep following it (long
@@ -1154,7 +1169,7 @@ export async function apply(ctx, config) {
       let ready = false;
       let gaveUpIdle = false;
       while (Date.now() < hardCap) {
-        const evts = session?.events;
+        const evts = sessionEvents(session);
         const hasAssistant = Array.isArray(evts) && hasAssistantMessage(evts, baseline);
         const busy = agent.status === 'running';
         if (busy) { sawBusy = true; lastBusy = Date.now(); }
@@ -1184,9 +1199,9 @@ export async function apply(ctx, config) {
       }
 
       // 2) Read the newest assistant message after baseline.
-      const evts = session.events;
+      const evts = sessionEvents(session);
       let replyText = '';
-      for (let i = evts.length - 1; i >= baseline; i--) {
+      for (let i = (evts?.length ?? 0) - 1; i >= baseline; i--) {
         const evt = evts[i];
         if (evt?.type === 'assistant/message') {
           const t = textOfAssistantMessage(evt);
@@ -1242,7 +1257,7 @@ export async function apply(ctx, config) {
   // true when a notice was sent, false otherwise (no turn error found / send failed).
   async function notifyTurnFailure(agent, botId, chatId, baseline, opts = {}) {
     try {
-      const err = findTurnError(agent?.session?.events, baseline);
+      const err = findTurnError(sessionEvents(agent?.session), baseline);
       if (!err) return false;
       const brief = String(err.message || err.code || 'unknown error').replace(/\s+/g, ' ').slice(0, 400);
       const codeLine = err.code ? `\n<code>${escapeHtml(err.code)}</code>` : '';
@@ -2343,9 +2358,10 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
       for (let i = agents.length - 1; i >= 0; i--) {
         const agent = agents[i];
         const session = agent?.session;
-        if (!session || !Array.isArray(session.events)) continue;
-        for (let j = session.events.length - 1; j >= 0; j--) {
-          const evt = session.events[j];
+        const evts = sessionEvents(session);
+        if (!session || !Array.isArray(evts)) continue;
+        for (let j = evts.length - 1; j >= 0; j--) {
+          const evt = evts[j];
           if (evt?.type === 'assistant/message') {
             return textOfAssistantMessage(evt) || '(assistant message with no text content)';
           }
@@ -2870,7 +2886,7 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
     // applies). Mirrors dsh-sandbox-policy's effectiveSandboxMode so we can capture
     // the "previous" mode to restore later without importing that package.
     function effectiveSandboxModeOf(agent) {
-      const events = agent?.session?.events;
+      const events = sessionEvents(agent?.session);
       if (!Array.isArray(events)) return undefined;
       for (let i = events.length - 1; i >= 0; i--) {
         if (events[i]?.type === 'sandbox/mode') return events[i].data?.mode;
@@ -3021,7 +3037,7 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
     }
 
     function formatSessionHistory(agent, limit = 12, perMsgCap = 280) {
-      const events = agent.session?.events;
+      const events = sessionEvents(agent?.session);
       if (!Array.isArray(events)) return '（无事件）';
       const items = [];
       for (const evt of events) {
@@ -3488,9 +3504,7 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
             // Baseline = number of events before we inject this message. The
             // progress indicator only watches events with seq > baseline so it
             // reflects this turn (tool calls / thinking) and not old history.
-            const baseline = currentAgent.session && Array.isArray(currentAgent.session.events)
-              ? currentAgent.session.events.length
-              : 0;
+            const baseline = sessionEvents(currentAgent.session)?.length ?? 0;
 
             // Public API: agent.followup(msg) === send(msg, 'next-turn', true).
             // (The previous version called the private wakeDriver() directly.)

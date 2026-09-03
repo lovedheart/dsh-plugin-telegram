@@ -23,6 +23,21 @@ export function tailOf(str, max) {
   return str.length > max ? '…' + str.slice(-max) : str;
 }
 
+/**
+ * Session event-log accessor compatible with both dsh-session APIs:
+ *   • ≤ 0.1.1-rc.x: `session.events` getter (frozen snapshot of the log)
+ *   • 0.1.2-rc.1+:  the getter was REMOVED; `session.snapshotEvents()` is
+ *     the equivalent. Reading `.events` yields undefined on the new class.
+ */
+export function sessionEvents(session) {
+  if (!session) return undefined;
+  if (Array.isArray(session.events)) return session.events;
+  if (typeof session.snapshotEvents === 'function') {
+    try { return session.snapshotEvents(); } catch { return undefined; }
+  }
+  return undefined;
+}
+
 /** Collapse runs of whitespace to a single space and trim. */
 export function compactText(str) {
   return String(str ?? '').replace(/\s+/g, ' ').trim();
@@ -423,7 +438,7 @@ export class ProgressIndicator {
       this.typing();
       // Always fold the session log first: if the turn already ended we stop
       // right away (and never post the indicator for an instant turn).
-      const evts = this.o.agent?.session?.events;
+      const evts = sessionEvents(this.o.agent?.session);
       if (Array.isArray(evts)) {
         const done = this.processEvents(evts);
         if (done) { this.endedByTurnEnd = true; await this.stop(); return; }

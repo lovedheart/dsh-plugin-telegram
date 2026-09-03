@@ -29,6 +29,20 @@
 // Max display-width (in "columns", CJK ≈ 2) for the per-subagent work line so
 // the board stays phone-friendly and well under Telegram's 4096-char limit.
 export const DEFAULT_MAX_WORK_WIDTH = 74;
+
+/**
+ * Session event-log accessor compatible with both dsh-session APIs
+ * (≤0.1.1-rc: `.events` getter; 0.1.2-rc.1+: getter removed, use
+ * `.snapshotEvents()`). See index.js sessionEvents for the rationale.
+ */
+export function sessionEvents(session) {
+  if (!session) return undefined;
+  if (Array.isArray(session.events)) return session.events;
+  if (typeof session.snapshotEvents === 'function') {
+    try { return session.snapshotEvents(); } catch { return undefined; }
+  }
+  return undefined;
+}
 // Max subagents rendered before collapsing the overflow into a "+K more" line.
 export const DEFAULT_MAX_ROWS = 10;
 // How often (ms) the board re-reads live child sessions while one is working.
@@ -98,7 +112,7 @@ export function normalizeStopReason(stopReason) {
 // Pull the short task label out of a child session: the `subagent/descriptor`
 // event's `label` (versioned, model-hidden). Returns '' when absent.
 export function labelFromSession(session) {
-  const events = session?.events;
+  const events = sessionEvents(session);
   if (!Array.isArray(events)) return '';
   for (const evt of events) {
     if (evt?.type === 'subagent/descriptor' && typeof evt?.data?.label === 'string') {
@@ -135,7 +149,7 @@ function summarizeArgs(args) {
 // then the latest reasoning, then the latest assistant text. `sinceSeq` skips
 // already-seen events (pass 0 to scan the whole log).
 export function latestActivity(session, sinceSeq = 0) {
-  const events = session?.events;
+  const events = sessionEvents(session);
   if (!Array.isArray(events)) return '';
   let tool = '';
   let reasoning = '';
@@ -230,7 +244,7 @@ function terminalReason(e, startWall, now) {
 // session) to a short description, keyed by the child session id when it can
 // be matched, else the last such call's description. Returns { byId, last }.
 export function parentSubagentDescriptions(session) {
-  const events = session?.events;
+  const events = sessionEvents(session);
   const byId = new Map();
   let last = '';
   if (!Array.isArray(events)) return { byId, last };
