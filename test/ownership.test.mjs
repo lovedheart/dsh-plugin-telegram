@@ -55,17 +55,6 @@ function mockTelegramApi() {
   return { restore: () => { globalThis.fetch = origFetch; }, seen };
 }
 
-let muxFrame = null; // set per test; FakeMuxWS delivers it ~40ms after open
-class FakeMuxWS {
-  constructor() {
-    this.handlers = {};
-    setTimeout(() => { (this.handlers.open || []).forEach((f) => f({})); }, 5);
-    setTimeout(() => { (this.handlers.message || []).forEach((f) => f({ data: JSON.stringify ? JSON.stringify(muxFrame) : '' })); }, 40);
-  }
-  addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); }
-  close() {}
-}
-
 function makeAgents() {
   const agents = [];
   const defaultAgent = {
@@ -95,13 +84,27 @@ function makeAgents() {
 
 function makeCtx(overrides = {}) {
   const effects = [];
+  const listeners = []; // { event, fn } — v0.7.0: in-process waterfall registrations
   const ctx = {
     tools: { register: () => {} },
-    on: () => {},
+    on: (event, fn) => { listeners.push({ event, fn }); },
     effect: (fn) => { effects.push(fn()); return () => {}; },
     get: (k) => (k in overrides ? overrides[k] : undefined),
   };
-  return { ctx, effects };
+  // Fire the `user-questions/request` waterfall the way dsh 0.1.3-alpha.2
+  // does: answerer first (prepend), then a `next()` standing in for the web
+  // answerer. Returns the answerer's promise (or next()'s outcome when
+  // delegated).
+  const fireQuestion = (request) => {
+    const entry = listeners.find((l) => l.event === 'user-questions/request');
+    if (!entry) throw new Error('no user-questions/request listener registered');
+    let nextCalled = false;
+    const next = async () => { nextCalled = true; return { answers: [] }; };
+    const p = entry.fn(request, next);
+    p.nextCalled = () => nextCalled;
+    return p;
+  };
+  return { ctx, effects, fireQuestion };
 }
 
 function baseConfig() {
@@ -126,46 +129,47 @@ console.log('ownership & visibility fixes (v0.6.4):');
 // ---- Bug 1: the shared WEB agent's questions must NOT reach the phone ----
 await atest('question from unrouted shared default agent → no card (web keeps it)', async () => {
   const api = mockTelegramApi();
-  const origWS = globalThis.WebSocket;
-  globalThis.WebSocket = FakeMuxWS;
-  muxFrame = {
-    type: 'server-request', rpcId: 'rpc-own-1', method: 'question/requested',
-    payload: { type: 'question/requested', sessionId: 'AG0',
-      questions: [{ id: 'q1', question: 'WEB-ONLY question?', header: 'H', options: [{ label: 'A' }] }] },
-  };
   const { restore: restDir } = isolateDir();
-  const { ctx, effects } = makeCtx({ agents: makeAgents().svc });
+  const ag = makeAgents();
+  const { ctx, effects, fireQuestion } = makeCtx({ agents: ag.svc });
   try {
     await apply(ctx, Object.assign(baseConfig(), {
       botToken: 'OWN1', questionsEnabled: true, questionsForDefaultAgent: true,
-      webUrl: 'http://127.0.0.1:9',
     }));
-    await sleep(600); // well past the fake frame delivery (40ms)
+    // v0.7.0: the ask arrives through the in-process waterfall with the live
+    // calling agent — here the shared (web) default agent, session id AG0.
+    const p = fireQuestion({
+      questions: [{ id: 'q1', question: 'WEB-ONLY question?', header: 'H', options: [{ label: 'A' }] }],
+      agent: ag.defaultAgent,
+    });
+    p.catch(() => {});
+    const ans = await p;
+    assert.deepEqual(ans, { answers: [] }, 'delegated to the web answerer via next()');
+    assert.ok(p.nextCalled(), 'next() was called (web keeps the question)');
     const card = api.seen.find((s) => s.method === 'sendMessage' && s.body?.text?.includes('WEB-ONLY question?'));
     assert.ok(!card, 'shared default agent question NOT claimed (no chatAgents route to it)');
   } finally {
-    cleanupAll(effects); globalThis.WebSocket = origWS; api.restore(); restDir();
+    cleanupAll(effects); api.restore(); restDir();
   }
 });
 
 await atest('chat explicitly /use-routed to the shared agent → card on the phone', async () => {
   const api = mockTelegramApi();
-  const origWS = globalThis.WebSocket;
-  globalThis.WebSocket = FakeMuxWS;
-  muxFrame = {
-    type: 'server-request', rpcId: 'rpc-own-2', method: 'question/requested',
-    payload: { type: 'question/requested', sessionId: 'AG0',
-      questions: [{ id: 'q1', question: 'ROUTED question?', header: 'H', options: [{ label: 'A' }] }] },
-  };
   const { restore: restDir } = isolateDir();
-  const { ctx, effects } = makeCtx({ agents: makeAgents().svc });
+  const ag = makeAgents();
+  const { ctx, effects, fireQuestion } = makeCtx({ agents: ag.svc });
   try {
     await apply(ctx, Object.assign(baseConfig(), {
       botToken: 'OWN2', questionsEnabled: true, questionsForDefaultAgent: true,
-      webUrl: 'http://127.0.0.1:9',
     }));
     // Simulate `/use AG0`: this chat explicitly routes to the shared agent.
     __testHooks.chatAgents.set('default::1', 'AG0');
+    const p = fireQuestion({
+      questions: [{ id: 'q1', question: 'ROUTED question?', header: 'H', options: [{ label: 'A' }] }],
+      agent: ag.defaultAgent,
+    });
+    p.catch(() => {});
+    assert.ok(!p.nextCalled(), 'routed shared agent is claimed, not delegated');
     const start = Date.now();
     let card = null;
     while (Date.now() - start < 3000) {
@@ -177,7 +181,7 @@ await atest('chat explicitly /use-routed to the shared agent → card on the pho
     assert.equal(String(card.body.chat_id), '1', 'card went to the routed chat');
   } finally {
     __testHooks.chatAgents.delete('default::1');
-    cleanupAll(effects); globalThis.WebSocket = origWS; api.restore(); restDir();
+    cleanupAll(effects); api.restore(); restDir();
   }
 });
 

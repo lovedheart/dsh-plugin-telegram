@@ -4,20 +4,19 @@
 //   apply() handed the question (and approval) modules `activeClient: moduleClient`,
 //   but both modules read `deps.client`. Result: deps.client === undefined and
 //   every card send threw "Cannot read properties of undefined (reading
-//   'sendMessage')" — the journal showed onRequested + ownership hit, then
-//   CARD-SEND-FAIL, so the user saw nothing on Telegram.
+//   'sendMessage')" — so the user saw nothing on Telegram.
 //
-// This test drives the REAL chain end to end: apply() → createMuxSubscriber
-// (stubbed WebSocket) → question module → clientDispatch → TelegramClient
-// → (stubbed fetch) Telegram API. It asserts the card's sendMessage actually
-// reaches the wire with option buttons.
+// This test drives the REAL chain end to end: apply() → the registered
+// `user-questions/request` answerer (v0.7.0 in-process waterfall, replacing
+// the old mux subscription) → question module → clientDispatch →
+// TelegramClient → (stubbed fetch) Telegram API. It asserts the card's
+// sendMessage actually reaches the wire with option buttons.
 //
 // Kept in its OWN process: the multi-bot suite accumulates a large live heap
 // across ~32 apply() calls and a 33rd apply OOMs a 512MB test heap.
 
 import { strict as assert } from 'node:assert';
 import { apply, botRegistry, __testHooks } from '../src/index.js';
-import { QUESTION_CALLBACK_PREFIX } from '../src/questions.js';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as pathJoin } from 'node:path';
@@ -51,52 +50,28 @@ function mockTelegramApi() {
   return { restore: () => { globalThis.fetch = origFetch; }, seen };
 }
 
-// The mux frame the next FakeMuxWS delivers. Defaults to the rt-33 frame;
-// tests that need a different question (e.g. multi-bot routing) set it first.
-let muxFrame = {
-  type: 'server-request',
-  rpcId: 'rpc-rt-33',
-  method: 'question/requested',
-  payload: {
-    type: 'question/requested',
-    sessionId: 'telegram-rt-33',
-    questions: [{ id: 'q1', question: 'Pick one?', header: 'H', options: [{ label: 'Alpha' }, { label: 'Beta' }] }],
-  },
-};
-const resetMuxFrame = () => {
-  muxFrame = {
-    type: 'server-request',
-    rpcId: 'rpc-rt-33',
-    method: 'question/requested',
-    payload: {
-      type: 'question/requested',
-      sessionId: 'telegram-rt-33',
-      questions: [{ id: 'q1', question: 'Pick one?', header: 'H', options: [{ label: 'Alpha' }, { label: 'Beta' }] }],
-    },
-  };
-};
-
-// Fake mux WebSocket: opens, then delivers one question/requested frame.
-class FakeMuxWS {
-  constructor(url) {
-    this.url = url;
-    this.handlers = {};
-    setTimeout(() => { (this.handlers.open || []).forEach((f) => f({})); }, 5);
-    setTimeout(() => { (this.handlers.message || []).forEach((f) => f({ data: JSON.stringify(muxFrame) })); }, 40);
-  }
-  addEventListener(type, fn) { (this.handlers[type] ||= []).push(fn); }
-  close() {}
-}
-
 function makeCtx() {
   const effects = [];
+  const listeners = []; // { event, fn, opts }
   const ctx = {
     tools: { register: () => {} },
-    on: () => {},
+    on: (event, fn, opts) => { listeners.push({ event, fn, opts }); },
     effect: (fn) => { effects.push(fn()); return () => {}; },
     get: () => undefined,
   };
-  return { ctx, effects };
+  // Stand in for the host's `ctx.waterfall(..., 'user-questions/request', ...)`:
+  // invoke the prepend-registered answerer with a next() standing for the
+  // rest of the chain (the web answerer).
+  const fireQuestion = (request) => {
+    const entry = listeners.find((l) => l.event === 'user-questions/request');
+    if (!entry) throw new Error('no user-questions/request listener registered by apply()');
+    let nextCalled = false;
+    const next = async () => { nextCalled = true; return { answers: [] }; };
+    const p = entry.fn(request, next);
+    p.nextCalled = () => nextCalled;
+    return p;
+  };
+  return { ctx, effects, fireQuestion };
 }
 
 function baseConfig() {
@@ -123,19 +98,20 @@ function isolateDir() {
   return { restore: () => { if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev; } };
 }
 
-console.log('questions wiring (apply → mux → module → client → wire):');
+console.log('questions wiring (apply → waterfall answerer → module → client → wire):');
 
 await atest('apply() wires a working client into the question module (card actually posts)', async () => {
   const api = mockTelegramApi();
-  const origWS = globalThis.WebSocket;
-  globalThis.WebSocket = FakeMuxWS;
   const { restore: restDir } = isolateDir();
-  const { ctx, effects } = makeCtx();
+  const { ctx, effects, fireQuestion } = makeCtx();
   try {
-    await apply(ctx, Object.assign(baseConfig(), {
-      botToken: 'RT33',
-      webUrl: 'http://127.0.0.1:9', // never dialled — the WebSocket global is stubbed
-    }));
+    await apply(ctx, Object.assign(baseConfig(), { botToken: 'RT33' }));
+    const p = fireQuestion({
+      questions: [{ id: 'q1', question: 'Pick one?', header: 'H', options: [{ label: 'Alpha' }, { label: 'Beta' }] }],
+      agent: { id: 'telegram-rt-33', session: { id: 'telegram-rt-33' } },
+    });
+    p.catch(() => {});
+    assert.ok(!p.nextCalled(), 'telegram-agent question claimed, not delegated');
     const start = Date.now();
     let sent = null;
     while (Date.now() - start < 3000) {
@@ -149,10 +125,8 @@ await atest('apply() wires a working client into the question module (card actua
     assert.ok(JSON.stringify(kb).includes('Alpha') && JSON.stringify(kb).includes('Beta'), 'option labels on buttons');
   } finally {
     for (const eff of effects) { try { eff(); } catch { /* ignore */ } }
-    globalThis.WebSocket = origWS;
     api.restore();
     restDir();
-    resetMuxFrame();
   }
 });
 
@@ -175,24 +149,8 @@ await atest('apply() wires a working client into the question module (card actua
 //   → clientDispatch proxy → answerCallbackQuery on the OWNING bot's wire.
 await atest('multi-bot: tapping 提交 acks on the owning bot (clientDispatch routes answerCallbackQuery)', async () => {
   const api = mockTelegramApi();
-  const origWS = globalThis.WebSocket;
-  // Route the question to bob's chat (2) so ownership resolves to chatId '2'.
-  muxFrame = {
-    type: 'server-request',
-    rpcId: 'rpc-rt-mb',
-    method: 'question/requested',
-    payload: {
-      type: 'question/requested',
-      sessionId: 'telegram-rt-mb',
-      // multiSelect (camelCase = the broadcast form; dsh-tool-ask-user maps the
-      // tool's `multi_select` → `multiSelect` before pushing the frame). A
-      // multi-select card carries a "✅ 提交" row; single-select has none.
-      questions: [{ id: 'q1', question: 'MB pick?', header: 'H', multiSelect: true, options: [{ label: 'X' }, { label: 'Y' }] }],
-    },
-  };
-  globalThis.WebSocket = FakeMuxWS;
   const { restore: restDir } = isolateDir();
-  const { ctx, effects } = makeCtx();
+  const { ctx, effects, fireQuestion } = makeCtx();
   try {
     await apply(ctx, Object.assign(baseConfig(), {
       // Multi-bot: NO 'default' bot exists, so the old bug (clientFor('default'))
@@ -203,12 +161,19 @@ await atest('multi-bot: tapping 提交 acks on the owning bot (clientDispatch ro
       ],
       // No top-level defaultChatId; chat routing must come from chatAgents.
       defaultChatId: null,
-      webUrl: 'http://127.0.0.1:9', // never dialled — WebSocket global stubbed
     }));
     // Register the chat→bot + chat→session mapping the way /new / an inbound
     // message would, so ownership Case 1 resolves chatId '2' (bob's chat).
     __testHooks.chatAgents.set('bob::2', 'telegram-rt-mb');
     __testHooks.chatAgents.set('alice::1', 'telegram-rt-a'); // alice owns chat 1
+    // multiSelect (camelCase = the shape dsh-tool-ask-user hands the
+    // waterfall after mapping the tool's `multi_select`). A multi-select card
+    // carries a "✅ 提交" row; single-select has none.
+    const p = fireQuestion({
+      questions: [{ id: 'q1', question: 'MB pick?', header: 'H', multiSelect: true, options: [{ label: 'X' }, { label: 'Y' }] }],
+      agent: { id: 'telegram-rt-mb', session: { id: 'telegram-rt-mb' } },
+    });
+    p.catch(() => {});
     const start = Date.now();
     let card = null;
     while (Date.now() - start < 3000) {
@@ -243,12 +208,13 @@ await atest('multi-bot: tapping 提交 acks on the owning bot (clientDispatch ro
     const acks = api.seen.filter((s) => s.method === 'answerCallbackQuery' && s.body?.callback_query_id === 'cb-mb-1');
     assert.equal(acks.length, 1, 'exactly one answerCallbackQuery for the tap');
     assert.equal(acks[0].token, 'TOK_MBB', 'ack answered on BOB (owning bot), not the missing "default"');
+    // And the submit settled the ask: the waterfall promise resolved with the picks.
+    const ans = await p;
+    assert.ok(ans && Array.isArray(ans.answers), 'submit resolved the waterfall promise');
   } finally {
     for (const eff of effects) { try { eff(); } catch { /* ignore */ } }
-    globalThis.WebSocket = origWS;
     api.restore();
     restDir();
-    resetMuxFrame();
   }
 });
 

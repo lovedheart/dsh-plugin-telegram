@@ -24,8 +24,6 @@ import {
 } from './approval.js';
 import {
   createQuestionModule,
-  createMuxSubscriber,
-  parseSseFrames,
   parseQuestionCallback,
 } from './questions.js';
 import { chunkText, markdownToTelegramHtml, guardConvertedLength } from './text.js';
@@ -154,15 +152,15 @@ const defaults = {
   // (atomic write, survives reload); manage them via /approval. '' = default
   // location under $DSH_HOME; set an absolute path to relocate.
   approvalAlwaysPath: '',
-  // ask_user_question answerer (v0.4.4). When the agent calls ask_user_question
-  // (pick an option / type your own), the web host owns the single UI provider
-  // and only the BROWSER sees the prompt — a phone-only user waits forever. This
-  // plugin subscribes to the web host's /api/events.mux over loopback and posts
-  // an inline-keyboard card for questions belonging to our Telegram agents (or,
-  // when questionsForDefaultAgent is true, the default shared agent); answers go
-  // back via /api/respond. A plain-text reply to a single-question card is
-  // consumed as a custom answer. questionsForDefaultAgent mirrors
-  // approvalForDefaultAgent (default true, only when defaultChatId is set).
+  // ask_user_question answerer (v0.4.4; in-process since v0.7.0). When the
+  // agent calls ask_user_question (pick an option / type your own), alpha.2
+  // runs the `user-questions/request` waterfall — this plugin joins it
+  // in-process and posts an inline-keyboard card for questions belonging to
+  // our Telegram agents (or, when questionsForDefaultAgent is true, the
+  // default shared agent), resolving the ask directly from the button taps.
+  // Everything else delegates to the web UI. A plain-text reply to a
+  // single-question card is consumed as a custom answer.
+  // questionsForDefaultAgent mirrors approvalForDefaultAgent (default true).
   questionsEnabled: true,
   questionsForDefaultAgent: true,
   // Bound how long a question card waits for a tap before auto-cancelling
@@ -194,10 +192,6 @@ const defaults = {
   // Takeover window (ms) before an autopilot question auto-commits the
   // recommended answer. 0 = commit immediately (post-hoc notice only).
   autopilotWindowMs: 10000,
-  // Web host base URL the plugin reaches over loopback. Normally derived from
-  // DSH_WEB_URL (the plugin runs inside the `dsh web` process); set to
-  // override (e.g. a non-default port) or empty to force the 3080 default.
-  webUrl: '',
   // Voice (TTS) — used by telegram_send_voice.
   ttsEndpoint: 'http://127.0.0.1:8890', // local Qwen3-TTS service
   ttsLang: 'Chinese',                   // default language label for synthesis
@@ -273,7 +267,6 @@ const schema = {
   autopilotEnabled: ['boolean'],
   autopilotSandboxMode: ['string'],
   autopilotWindowMs: ['number'],
-  webUrl: ['string'],
   ttsEndpoint: ['string'],
   ttsLang: ['string'],
   sttEndpoint: ['string'],
@@ -692,21 +685,16 @@ export async function apply(ctx, config) {
   const approvalTimeoutMs = Math.max(0, Number(c.approvalTimeoutSec) || 0) * 1000;
   const approvalForDefaultAgent = c.approvalForDefaultAgent !== false;
 
-  // ask_user_question answerer (v0.4.4): surfaces the agent's "pick an option
-  // / type your own" prompts on Telegram. We subscribe to the web host's
-  // /api/events.mux over loopback and answer via /api/respond. `webUrl` is the
-  // dsh web base URL — the plugin runs inside the SAME process, so
-  // process.env.DSH_WEB_URL (set by `dsh web`) is authoritative; the config
-  // key only exists as an override for unusual deployments.
-  // `questionsForDefaultAgent` mirrors `approvalForDefaultAgent`: before /new a
-  // plain Telegram message routes to the deployment's DEFAULT (shared) agent,
-  // so its questions must also reach the phone by default.
+  // ask_user_question answerer (v0.4.4; in-process since v0.7.0): surfaces the
+  // agent's "pick an option / type your own" prompts on Telegram by joining
+  // the `user-questions/request` waterfall in-process (no loopback HTTP — the
+  // old /api/events.mux + /api/respond channel died behind alpha.2's auth).
+  // `questionsForDefaultAgent` mirrors `approvalForDefaultAgent`: a (bot, chat)
+  // routed via /use to the deployment's DEFAULT (shared) agent must also get
+  // its questions on the phone.
   const questionsEnabled = c.questionsEnabled !== false;
   const questionsForDefaultAgent = c.questionsForDefaultAgent !== false;
   const questionsTimeoutMs = Math.max(0, Number(c.questionsTimeoutSec) || 0) * 1000;
-  const webUrl =
-    (typeof c.webUrl === 'string' && c.webUrl.trim() ? c.webUrl.trim()
-      : process.env.DSH_WEB_URL || '') || 'http://127.0.0.1:3080';
 
   // Allow-always store: remembers rule keys the user has approved-with-remember
   // so matching future asks auto-approve. The file path is resolved lazily
@@ -802,7 +790,6 @@ export async function apply(ctx, config) {
   let questionCancel = null;
   let questionHandleQuery = null;
   let questionConsumeText = null;
-  let muxStop = null;
 
   // Dedup set of injected Telegram message ids (in-memory; bounded by a cap
   // below so a long-running plugin can't leak memory).
@@ -3699,28 +3686,19 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
     }
 
     // ---------------------------------------------------------------------
-    // ask_user_question answerer (v0.4.4).
+    // ask_user_question answerer (v0.4.4; in-process since v0.7.0).
     //
     // The agent can pause to ask the user to pick an option (or type their own
-    // prompt) via the `ask_user_question` tool. DSH's web host owns the single
-    // UI provider and only the BROWSER sees the prompt — a phone-only user waits
-    // forever. We subscribe to the web host's /api/events.mux over loopback
-    // (same process), claim the questions that belong to our Telegram agents
-    // (same ownership policy as approval), post an inline-keyboard card, and
-    // answer via /api/respond. A plain-text reply to a single-question card is
-    // consumed as a custom answer. Best-effort: a loopback failure never
-    // affects the real reply — the web UI keeps working.
+    // prompt) via the `ask_user_question` tool. alpha.2 routes every ask
+    // through the `user-questions/request` waterfall (the old /api/events.mux
+    // + /api/respond loopback channel died behind the new auth). We register
+    // a `prepend` answerer in-process: it claims the questions that belong to
+    // our Telegram agents (same ownership policy as approval), posts an
+    // inline-keyboard card, and resolves the ask when the user taps or replies
+    // in plain text. Everything else — and every card we fail to deliver —
+    // goes to `next()`, so the web UI keeps working.
     // ---------------------------------------------------------------------
-    if (questionsEnabled && activeClient) {
-      const respondQuestion = async (body) => {
-        const res = await fetch(`${webUrl.replace(/\/$/, '')}/api/respond`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        const json = await res.json().catch(() => ({}));
-        return json; // { accepted: true } | { accepted: false, reason }
-      };
+    if (questionsEnabled && activeClient && typeof ctx.on === 'function') {
       const questionModule = createQuestionModule({
         log,
         escape: (s) => escapeHtml(s),
@@ -3728,8 +3706,9 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
         // clientDispatch routes each call to the owning bot via the card's
         // chatId / active-card context). Legacy config → always default bot.
         client: moduleClient,
-        ownership: (sessionId) => telegramAgentOwnership(sessionId, { allowDefault: questionsForDefaultAgent }),
-        respond: respondQuestion,
+        // The waterfall hands us the live calling agent (same shape approval
+        // sees); ownership maps agent.id / agent.session.id to (bot, chat).
+        ownership: (agent) => telegramAgentOwnership(agent?.id ?? agent?.session?.id, { allowDefault: questionsForDefaultAgent }),
         // Auto-cancel a question card after this long without a tap (0 = no cap).
         timeoutMs: questionsTimeoutMs,
         // Autopilot (v0.5.0): auto-adopt the recommended option when the owning
@@ -3746,12 +3725,10 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
       questionHandleQuery = questionModule.handleCallbackQuery;
       questionConsumeText = (chatId, botId, text) => questionModule.consumeTextReply(chatId, botId, text);
       questionCancel = () => { try { questionModule.cancelAll(); } catch { /* ignore */ } };
-      muxStop = createMuxSubscriber({
-        url: webUrl,
-        log,
-        onFrame: (frame) => questionModule.handleFrame(frame),
-      });
-      log('info', `ask_user_question answerer registered (subscribed to ${webUrl}/api/events.mux).`);
+      // Registered `prepend` so we run before the web answerer; self-filters
+      // to our Telegram agents and delegates everything else via next().
+      ctx.on('user-questions/request', (req, next) => questionModule.handleRequest(req, next), { prepend: true });
+      log('info', 'ask_user_question answerer registered (in-process user-questions/request waterfall).');
     }
 
     // Per-bot callback handler (v0.5.x P3): the SOURCE bot is derived from the
@@ -3953,10 +3930,8 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
       approvalCancel = null;
       approvalHandleQuery = null;
       approvalClearNotice = null;
-      // Stop the ask_user_question answerer: drop the mux subscription and
-      // forget pending cards (no network — the web host keeps working).
-      try { muxStop?.(); } catch { /* ignore */ }
-      muxStop = null;
+      // Cancel any in-flight question cards so their waterfall promises settle
+      // (cancelled) rather than hanging after unload.
       try { questionCancel?.(); } catch { /* ignore */ }
       questionCancel = null;
       questionHandleQuery = null;
