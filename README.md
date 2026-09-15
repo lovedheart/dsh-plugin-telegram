@@ -286,9 +286,14 @@ accidentally picking up the first bot's token.
   `telegram_send_document`, `telegram_edit_message`, `telegram_delete_message`, …) now
   accepts an **optional `bot` parameter** (a bot id). Resolution order:
   (1) explicit `bot` — must be a known, connected bot, else a clear tool error;
-  (2) the **owning bot of the target chat** (composite-key reverse lookup, the
-  bot whose poller last routed a message for that chat);
-  (3) the first/legacy bot. A single-bot config is unaffected.
+  (2) the **owning bot of the target chat** when exactly one bot routes that
+  chatId (composite-key reverse lookup, the bot whose poller last routed a
+  message for that chat);
+  (3) when **two bots share one chatId** (e.g. both bots' private chats with
+  the same owner), the **calling agent decides** (v0.6.5): sends go back out
+  the bot that owns the agent running the tool call — not the first bot in
+  the registry, which is what used to make bot B's photos arrive from bot A;
+  (4) the first/legacy bot. A single-bot config is unaffected.
 - **`telegram_get_info` now returns an ARRAY — one entry per configured bot**:
   `{ id, username, botId, name, connected, defaultChat }`. A legacy single-bot
   config returns exactly one entry (`id: "default"`), so single-bot callers see

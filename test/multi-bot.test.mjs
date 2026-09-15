@@ -1102,5 +1102,64 @@ await atest('T32 unload leaves no residue: pollers stopped, board keys cleared, 
   }
 });
 
+// T33 v0.6.5 共享 chatId 串线 bug：两 bot 路由同一 chatId 时，工具发送必须走
+//     「调用方 agent 所属的 bot」（exec.agent），不再按 Map 顺序误走第一个 bot。
+await atest('T33 shared chatId: sends route by CALLING AGENT, not first-bot-in-map', async () => { {
+  const rec = recordTelegramApi({ TKNA: 'alice', TKNB: 'bob' });
+  const { restore: restDir } = isolateDir();
+  const fa = fakeAgents();
+  const { ctx, effects, registered } = makeCtx({ agents: fa.svc });
+  try {
+    await apply(ctx, Object.assign(baseConfig(), {
+      pollingEnabled: true, progressEnabled: false, subagentBoardEnabled: false,
+      bots: [
+        { id: 'alice', token: 'TKNA', allowedUsers: ['u1'] },
+        { id: 'bob', token: 'TKNB', allowedUsers: ['u2'] },
+      ],
+    }));
+    await waitMe('alice'); await waitMe('bob');
+    const hA = botRegistry.get('alice').poller.messageHandlers[0];
+    const hB = botRegistry.get('bob').poller.messageHandlers[0];
+    // Both bots route the SAME chatId '7' (shared private chat, e.g. the same
+    // user chatting with two bots). Each inbound auto-creates its own agent.
+    await hA({ chatId: '7', messageId: 901, chatType: 'private', senderId: 'u1', text: 'hi alice' });
+    await hB({ chatId: '7', messageId: 902, chatType: 'private', senderId: 'u2', text: 'hi bob' });
+    const created = fa.created();
+    assert.equal(created.length, 2, 'one agent per (bot, chat) created');
+    const agentA = created[0], agentB = created[1];
+    const tools = new Map(registered.map((t) => [t.name, t]));
+    const sendMsg = tools.get('telegram_send_message');
+    const sendPhoto = tools.get('telegram_send_photo');
+    assert.ok(sendMsg && sendPhoto, 'send tools registered');
+    // Bob's agent sends (the reported bug: before the fix this landed on
+    // alice, the first bot in Map order).
+    let out = await sendMsg.execute({ chat_id: '7', text: 'from-bob' }, { agent: agentB });
+    assert.match(out, /Message sent successfully/, 'bob-agent send returned success');
+    assert.equal(rec.byToken('TKNB', 'sendMessage').length, 1, 'bob agent send lands on BOB client');
+    assert.equal(rec.byToken('TKNA', 'sendMessage').length, 0, 'NO crosstalk to alice for bob-agent send');
+    // Alice's agent sends -> alice client.
+    out = await sendMsg.execute({ chat_id: '7', text: 'from-alice' }, { agent: agentA });
+    assert.match(out, /Message sent successfully/, 'alice-agent send returned success');
+    assert.equal(rec.byToken('TKNA', 'sendMessage').length, 1, 'alice agent send lands on ALICE client');
+    assert.equal(rec.byToken('TKNB', 'sendMessage').length, 1, 'alice-agent send did not hit bob');
+    // Photo tool too (the exact reported symptom: photos going to the other bot).
+    out = await sendPhoto.execute({ chat_id: '7', photo: 'https://example.com/x.png' }, { agent: agentB });
+    assert.match(out, /Photo sent successfully/, 'bob-agent photo send returned success');
+    assert.equal(rec.byToken('TKNB', 'sendPhoto').length, 1, 'bob agent photo lands on BOB client');
+    assert.equal(rec.byToken('TKNA', 'sendPhoto').length, 0, 'no photo crosstalk to alice');
+    // An unknown/absent agent (e.g. web-context tool call) on the shared chat
+    // keeps the old deterministic choice: first connected owner (alice).
+    out = await sendMsg.execute({ chat_id: '7', text: 'no-agent' }, {});
+    assert.match(out, /Message sent successfully/, 'no-agent send still succeeds');
+    assert.equal(rec.byToken('TKNA', 'sendMessage').length, 2, 'no-agent shared-chat send falls back to first owner (alice)');
+    // Explicit `bot` still wins over everything.
+    out = await sendMsg.execute({ chat_id: '7', text: 'explicit', bot: 'bob' }, { agent: agentA });
+    assert.match(out, /Message sent successfully/, 'explicit-bot send returned success');
+    assert.equal(rec.byToken('TKNB', 'sendMessage').length, 2, 'explicit bot=bob lands on bob even from alice agent');
+  } finally {
+    cleanupAll(effects); restDir(); rec.restore();
+  }
+} });
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

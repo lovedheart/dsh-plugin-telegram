@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.5] - 2026-09-15
+
+### Fixed
+- **Cross-bot media routing on a shared chatId** (the "photos from bot B
+  arrive from bot A" bug). With two bots configured over the *same* chat
+  (e.g. both bots' private chats with one owner share chatId `8367...`),
+  the send/media/edit/delete tools resolved the target bot from the chatId
+  alone (`botIdForChat`), which scans `chatAgents` in Map order and always
+  picked the *first* bot. So an agent running under bot B that called
+  `telegram_send_photo` / `telegram_send_document` / `telegram_send_video` /
+  `telegram_send_audio` / `telegram_send_message` (or `telegram_edit_message`
+  / `telegram_delete_message`) delivered through **bot A** instead.
+  - `resolveBotClient(botArg, chatId, callerAgent)` now passes the
+    **calling agent** (`exec.agent`, which the DSH agent loop attaches to
+    every tool call) and uses it to disambiguate: when more than one bot
+    routes the same chatId, the media goes out the bot that **owns the
+    calling agent** (resolved via a new `botIdForAgent`, walking
+    `chatAgents` → `meta.botId` → `session.header.botId` → parentSession
+    chain). An explicit `bot` arg still wins over everything.
+  - When exactly one bot routes the chatId, or the config is single-bot,
+    behavior is **bit-identical** to the previous release — the agent
+    lookup only changes the outcome in the previously-ambiguous case.
+  - `telegram_get_info` and the tool `bot`-parameter descriptions now say
+    the default is "the bot running this conversation (the one the user
+    messaged)" rather than the ambiguous "the bot that owns the chat".
+  - Regression test **T33** (`test/multi-bot.test.mjs`): two bots route one
+    shared chatId; asserts each agent's `send_message` / `send_photo`
+    lands on its *own* client, an unknown-agent call falls back to the
+    first owner, and an explicit `bot` overrides. 33/33 pass.
+
 ## [0.6.0] - 2026-08-21
 
 ### Added
