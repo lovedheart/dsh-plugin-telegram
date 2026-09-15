@@ -7,7 +7,8 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 ## Features
 
 - **Send messages** with Markdown/HTML formatting
-- **Send photos and documents** via file_id or URL
+- **Send photos, documents, audio, video and voice notes** via file_id, URL or local path (voice text is synthesized by a local Qwen3-TTS service)
+- **Inbound voice transcription** (🎧) — voice notes are transcribed by a local Whisper proxy and answered without a round-trip
 - **Edit and delete** existing messages
 - **Long-polling** for incoming messages (optional)
 - **Agent integration**: Inject Telegram messages into DSH agent loop for AI-powered conversations
@@ -26,6 +27,9 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `telegram_send_message` | Send a text message to a chat |
 | `telegram_send_photo` | Send a photo to a chat |
 | `telegram_send_document` | Send a document to a chat |
+| `telegram_send_audio` | Send an audio file (file_id, URL, or local path) |
+| `telegram_send_video` | Send a video to a chat |
+| `telegram_send_voice` | Synthesize text to a voice note via local Qwen3-TTS and send as OGG Opus |
 | `telegram_edit_message` | Edit an existing message |
 | `telegram_delete_message` | Delete a message |
 | `telegram_get_info` | Get info about all configured bot(s) — returns an array, one entry per bot |
@@ -198,7 +202,8 @@ dsh web --patch ./cordis.yml
 | `directReplyTimeoutSec` | number | `3600` | (direct mode) Absolute safety cap (seconds) for the reply-forward watcher. The watcher is busy-aware — it follows the agent while it runs (long tool-call turns are fine) and forwards the reply the moment the agent goes idle with a fresh message; this cap only bounds pathological hangs. Short replies are still forwarded within seconds. |
 | `progressEnabled` | boolean | `true` | Show a live trajectory (tool calls + thinking) on Telegram while the agent works. Works in both `direct` and `tool` response modes. |
 | `progressDelaySec` | number | `5` | Only post the trajectory if the turn is still running after this many seconds (short turns show nothing). |
-| `progressIntervalMs` | number | `1200` | Minimum gap between in-place edits (Telegram rate-limits edits to ~1/s per message). |
+| `progressIntervalMs` | number | `5000` | Minimum gap between in-place edits (Telegram rate-limits edits to ~1/s per message; lowered frequency cuts API load). |
+| `progressTrailLines` | number | `3` | Streaming footer: how many recent activity lines (💭/🔧) to show under the in-place reply while the model is working (`0` = off). Keeps the message visibly moving during long tool-call/reasoning stretches. |
 | `progressPerBlockChars` | number | `240` | Max chars per trajectory line (a reasoning block or a tool call). |
 | `progressMaxChars` | number | `1500` | Max chars of the whole trajectory message (tail-truncated, so the newest items survive). |
 | `progressTimeoutSec` | number | `3600` | Absolute cap before the trajectory self-cleans (pathological hangs only). |
@@ -206,12 +211,12 @@ dsh web --patch ./cordis.yml
 | `approvalTimeoutSec` | number | `1800` | How long an approval card waits for a tap before expiring (`cancelled`). `0` = no expiry. |
 | `approvalForDefaultAgent` | boolean | `true` | Also surface asks from the deployment's **shared default agent** to the phone. Before `/new`, a plain Telegram message routes to that agent, so this is what makes the card appear in the state you usually test in. Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
 | `approvalAlwaysPath` | string | `''` | File where "🔁 一直允许" remembers are persisted (defaults to `$DSH_HOME/telegram-approval-always.json`). Set an absolute path to relocate. |
-| `questionsEnabled` | boolean | `true` | When the agent calls `ask_user_question` (pick an option / type your own), post an inline-keyboard question card to the owning chat and answer via the web host, so a phone-only user isn't left waiting on the browser. See "Question cards" below. |
+| `questionsEnabled` | boolean | `true` | When the agent calls `ask_user_question` (pick an option / type your own), post an inline-keyboard question card to the owning chat and answer it right there (in-process waterfall answerer), so a phone-only user isn't left waiting on the browser. See "Question cards" below. |
 | `questionsForDefaultAgent` | boolean | `true` | Also surface questions from the deployment's **shared default agent** to the phone (mirrors `approvalForDefaultAgent`). Set `false` to limit cards to agents this plugin explicitly created (`telegram-*`). Requires `defaultChatId`. |
 | `autopilotEnabled` | boolean | `true` | Whether the `/autopilot` command is available. Set `false` to disable full-auto mode entirely. See "Autopilot (full-auto mode)" below. |
 | `autopilotSandboxMode` | string | `danger-full-access` | Sandbox mode appended to the session while a chat is in autopilot (the "global write" half). Defaults to full disk access. |
 | `autopilotWindowMs` | number | `10000` | How long an autopilot `ask_user_question` notice waits before auto-committing the recommended option (`0` = commit immediately). Gives you a window to tap `✋ 接管` to take over. |
-| `webUrl` | string | `''` | Loopback base URL of the `dsh web` host the plugin reaches for question events/responses. Defaults to `DSH_WEB_URL` (set by `dsh web`), then `http://127.0.0.1:3080`. Override only for non-default ports. |
+| `questionsTimeoutSec` | number | `1800` | How long a question card waits for an answer before auto-cancelling (agent turn unblocks). `0` = no expiry. Mirrors `approvalTimeoutSec`. |
 | `sttEndpoint` | string | `http://127.0.0.1:18068` | OpenAI-compatible Whisper base URL used to transcribe inbound voice notes (same service `dsh-tool-audio`'s `transcribe_audio` hits). |
 | `voiceTranscribe` | boolean | `true` | When the user sends a voice note, transcribe it and reply with the text under the voice bubble (🎧). Requires `forwardInboundMedia`. |
 | `voiceTranscribeLanguage` | string | `auto` | Force a language code (e.g. `zh`/`en`) for transcription, or `auto` to let Whisper detect it. |
@@ -473,13 +478,16 @@ host owns the single UI provider for these asks, so **only the browser** sees
 the prompt; a phone-only user would wait forever with nothing on screen. This
 plugin adds a Telegram answerer:
 
-1. It subscribes to the web host's `/api/events.mux` over loopback (the plugin
-   runs inside the same `dsh web` process, reached via `DSH_WEB_URL` /
-   `http://127.0.0.1:3080`).
-2. When a `question/requested` frame arrives for **an agent this plugin owns**
-   (or, with `questionsForDefaultAgent`, the shared default agent), it posts an
-   **inline-keyboard card** to the owning chat.
-3. Your answer goes back to the web host via `/api/respond`.
+1. It registers a **prepend answerer on the `user-questions/request` Cordis
+   waterfall** (the plugin runs inside the same `dsh web` process, so there is
+   no loopback HTTP — since DSH 0.1.3-alpha.2 the question transport moved
+   behind the authenticated `/api/remote.mux` gateway and the old
+   `/api/events.mux` + `/api/respond` channel was retired).
+2. When a request arrives for **an agent this plugin owns** (or, with
+   `questionsForDefaultAgent`, the shared default agent), it posts an
+   **inline-keyboard card** to the owning chat; everything else is delegated
+   via `next()` so the web UI keeps working.
+3. Your answer resolves the pending ask directly from the button taps.
 
 **How you answer:**
 - **Single-choice question** — tap the option to answer instantly, **or just
@@ -489,10 +497,12 @@ plugin adds a Telegram answerer:
   to submit. A question with several sub-questions is button-only; any
   sub-question you leave unanswered is skipped.
 - **❌ 取消** cancels the ask.
-- If the **web UI answers first**, the card flips to "已在网页端回答" — the first
-  answer wins, so a late phone tap is dropped rather than double-submitted.
-- Reconnecting the bot is safe: the mux replays still-pending questions, so a
-  card is never lost on a drop.
+- If the **web UI answers first**, the delegated path settles the ask and the
+  card is re-rendered locked (options disabled) with a neutral status line —
+  the first answer wins, so a late phone tap is dropped rather than
+  double-submitted.
+- After `questionsTimeoutSec` an unanswered card auto-cancels so the agent
+  turn never hangs forever.
 
 Questions from **other (web-only) agents** are left to the browser — you won't
 see duplicate cards. Set `questionsEnabled: false` to turn this off.
@@ -661,8 +671,10 @@ dsh-plugin-telegram/
 │   ├── client.js       # Telegram Bot API HTTP client (incl. pin/unpin, multipart upload)
 │   ├── poller.js       # Long-polling background service (per-bot)
 │   ├── text.js         # Pure text helpers (Markdown→HTML, fence-aware chunking)
+│   ├── progress.js     # Live-trajectory indicator (streaming footer, activity trail)
+│   ├── inbound-media.js# Inbound media download + image sniffing (voice/photo handling)
 │   ├── approval.js     # Tool-guard approval cards (incl. "allow always" remember-rules)
-│   ├── questions.js    # ask_user_question cards (web-host mux bridge)
+│   ├── questions.js    # ask_user_question cards (in-process user-questions/request waterfall)
 │   └── subagents.js    # Live subagent board (state, render, throttled flush)
 ├── test/
 │   ├── text.test.mjs           # Pure text helpers (chunking, Markdown→HTML)
@@ -670,15 +682,19 @@ dsh-plugin-telegram/
 │   ├── poller.test.mjs         # Poller loop / offset / dedup
 │   ├── progress.test.mjs       # Live-trajectory indicator
 │   ├── approval.test.mjs       # Approval cards + allow-always rules
-│   ├── questions.test.mjs      # Question cards + mux bridge
+│   ├── questions.test.mjs      # Question cards (waterfall answerer)
+│   ├── questions-wiring.test.mjs # Question answerer wiring
 │   ├── subagents.test.mjs      # Subagent board
 │   ├── command-media.test.mjs  # Command media helpers
+│   ├── ownership.test.mjs      # Agent-ownership policy (web vs telegram routing)
 │   └── multi-bot.test.mjs      # Multi-bot config contract + routing (T1–T32)
 └── lib/                # Built output (copy of src/; `npm run prepare`)
     ├── index.js
     ├── client.js
     ├── poller.js
     ├── text.js
+    ├── progress.js
+    ├── inbound-media.js
     ├── approval.js
     ├── questions.js
     └── subagents.js
