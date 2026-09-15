@@ -39,8 +39,8 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | 命令 | 作用 |
 |---|---|
 | `/new` 或 `/clear` | 新建会话并路由过去（清空上下文；若当前会话在运行会先停止） |
-| `/sessions` | 列出活动会话（👉=当前，🏠=默认），含状态和模型 |
-| `/use <id>` | 切换到指定会话（支持短 id 前缀匹配） |
+| `/sessions` | 列出活动会话（👉=当前，🏠=默认），`s-xxxx` 短 id + 状态 + 会话标题（长标题折两行） |
+| `/use <s-id>` | 切换到指定会话（支持 `s-xxxx` 短 id、hex 前缀、完整 id） |
 | `/stop` | 停止当前会话正在执行的任务 |
 | `/compact` | 压缩当前会话历史为摘要（走 DSH compaction 服务） |
 | `/history [n]` | 查看最近 n 条对话（默认 12） |

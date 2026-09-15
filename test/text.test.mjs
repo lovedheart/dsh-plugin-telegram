@@ -1,7 +1,7 @@
 // Unit tests for the real pure helpers in src/text.js.
 // Run: node test/text.test.mjs
 import { strict as assert } from 'node:assert';
-import { chunkText, markdownToTelegramHtml, guardConvertedLength } from '../src/text.js';
+import { chunkText, markdownToTelegramHtml, guardConvertedLength, sessionShortIds, wrapDisplay } from '../src/text.js';
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -126,6 +126,53 @@ test('truncates raw when both exceed', () => {
   assert.equal(r.useParseMode, false);
   assert.equal(r.text.length, 100);
 });
+
+console.log('sessionShortIds / wrapDisplay:');
+test('short ids are s- + 4 hex chars', () => {
+  const m = sessionShortIds(['telegram-d7e47b35-1de0-4a11-9f2a-aabbccddeeff', 'session-74a4b2c1-0000-1111-2222-333344445555']);
+  assert.equal(m.get('telegram-d7e47b35-1de0-4a11-9f2a-aabbccddeeff').short, 's-d7e4');
+  assert.equal(m.get('session-74a4b2c1-0000-1111-2222-333344445555').short, 's-74a4');
+});
+test('colliding prefixes grow until unique', () => {
+  const m = sessionShortIds([
+    'telegram-d7e47b35-1111-1111-1111-111111111111',
+    'telegram-d7e49999-2222-2222-2222-222222222222',
+  ]);
+  const a = m.get('telegram-d7e47b35-1111-1111-1111-111111111111').short;
+  const b = m.get('telegram-d7e49999-2222-2222-2222-222222222222').short;
+  assert.ok(a !== b, 'handles must differ');
+  assert.ok(a.startsWith('s-d7e4') && b.startsWith('s-d7e4'));
+  assert.ok(a.length > 6 || b.length > 6, 'one grew longer than 4 hex chars');
+});
+test('core kept for /use matching', () => {
+  const m = sessionShortIds(['telegram-d7e47b35-1de0-4a11-9f2a-aabbccddeeff']);
+  assert.equal(m.get('telegram-d7e47b35-1de0-4a11-9f2a-aabbccddeeff').core, 'd7e47b35');
+});
+test('wrapDisplay single line when short', () => {
+  assert.deepEqual(wrapDisplay('fastllm_moe_pruning', 42, 2), ['fastllm_moe_pruning']);
+});
+test('wrapDisplay two lines with word break', () => {
+  const t = 'a'.repeat(30) + ' ' + 'b'.repeat(20);
+  const lines = wrapDisplay(t, 42, 2);
+  assert.equal(lines.length, 2);
+  assert.ok(lines[0].length <= 42);
+});
+test('wrapDisplay CJK width-aware 2 lines', () => {
+  const t = '编'.repeat(50); // 100 display cols
+  const lines = wrapDisplay(t, 42, 2);
+  assert.equal(lines.length, 2);
+  const w = (s) => [...s].reduce((a, c) => a + (c.codePointAt(0) > 0x2e7f ? 2 : 1), 0);
+  assert.ok(w(lines[0]) <= 42 && w(lines[1]) <= 42, `widths ${w(lines[0])}/${w(lines[1])}`);
+});
+test('wrapDisplay overflow ends with ellipsis', () => {
+  const lines = wrapDisplay('word '.repeat(40), 42, 2);
+  assert.equal(lines.length, 2);
+  assert.ok(lines[1].endsWith('…'), lines[1]);
+});
+test('wrapDisplay empty text', () => {
+  assert.deepEqual(wrapDisplay('   ', 42, 2), []);
+});
+
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
