@@ -22,10 +22,14 @@
 
 export function chunkText(text, maxSize) {
   if (!text) return [];
-  if (text.length <= maxSize) return [text];
+  // The hard-split path below reserves 4 chars for the re-fence; with a tiny
+  // or bogus limit it would never make progress (infinite loop → the whole
+  // event loop starves and the bot LOOKS deaf). Clamp to a workable floor.
+  const limit = Math.max(8, Math.floor(Number(maxSize)) || 0);
+  if (text.length <= limit) return [text];
 
   const chunks = [];
-  const half = Math.floor(maxSize / 2);
+  const half = Math.floor(limit / 2);
   let rest = text;
 
   while (rest.length > maxSize) {
@@ -47,31 +51,38 @@ export function chunkText(text, maxSize) {
         fenceCount++;
         if (fenceCount % 2 === 0) {
           const end = m.index + 3;
-          if (end > half) lastFenceClose = end; // a closing fence
+          if (end >= half) lastFenceClose = end; // a closing fence
         }
         continue;
       }
       const pos = m.index + 1;
-      if (fenceCount % 2 === 0 && pos > half) {
+      if (fenceCount % 2 === 0 && pos >= half) {
         if (m[0] === '\n') lastEvenNl = pos;
         else lastEvenSp = pos;
       }
     }
 
     const boundary = Math.max(lastFenceClose, lastEvenNl, lastEvenSp);
-    if (boundary > half) {
+    if (boundary >= half) {
       // Split at a fence-balanced boundary closest to the window end.
       const chunk = rest.slice(0, boundary);
       chunks.push(chunk);
       rest = rest.slice(boundary).replace(/^\s+/, '');
     } else {
-      // No balanced boundary in [half, maxSize]: a single code block longer
-      // than maxSize. Hard-split, close the block here, re-open in the next
-      // chunk so both render as code. Reserve 4 chars for the '```\n' we add.
-      const cut = maxSize - 4;
-      const chunk = rest.slice(0, cut) + '```\n';
-      chunks.push(chunk);
-      rest = '```\n' + rest.slice(cut).replace(/^\s+/, '');
+      // No balanced boundary in [half, limit]. If we are INSIDE an open code
+      // block (odd fence parity), hard-split and re-fence so both halves
+      // render as code. If parity is EVEN (e.g. one giant token, no open
+      // block), a plain split is correct — adding fences there shifted the
+      // fence pairing of every later chunk and mangled the rest of the
+      // message into <pre>.
+      const cut = limit - 4;
+      if (fenceCount % 2 === 1) {
+        chunks.push(rest.slice(0, cut) + '```\n');
+        rest = '```\n' + rest.slice(cut).replace(/^\s+/, '');
+      } else {
+        chunks.push(rest.slice(0, cut));
+        rest = rest.slice(cut).replace(/^\s+/, '');
+      }
     }
   }
   if (rest.length) chunks.push(rest);
@@ -126,15 +137,16 @@ function fenceGfmTables(text) {
     }
     const start = i;
     i += 2; // header + separator
-    while (i < lines.length && /^\s*\|/.test(lines[i])) i++;
+    while (i < lines.length && lines[i].includes('|') && lines[i].trim()) i++;
     out.push('```\n' + lines.slice(start, i).join('\n') + '\n```');
   }
   return out.join('\n');
 }
 
 export function markdownToTelegramHtml(md) {
-  const hasBacktick = md.includes('`');
-  let text = md
+  const src = String(md ?? ''); // never throw on undefined/null/numbers
+  const hasBacktick = src.includes('`');
+  let text = src
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
@@ -142,8 +154,13 @@ export function markdownToTelegramHtml(md) {
   // GFM tables -> code fences (rendered as <pre> by the next rule).
   text = fenceGfmTables(text);
 
-  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, __, code) => `<pre>${code.trim()}</pre>`);
-  text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Convert code spans FIRST and stash them: the styling rules below must
+  // never interpret markdown INSIDE code (``the `__init__` method`` used to
+  // become <code><b>init</b></code> → mangled output or a hard 400).
+  const stash = [];
+  const keep = (s) => `\u0000${stash.push(s) - 1}\u0000`;
+  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, __, code) => keep(`<pre>${code.trim()}</pre>`));
+  text = text.replace(/`([^`]+)`/g, (_, code) => keep(`<code>${code}</code>`));
   text = text.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
   text = text.replace(/__(.+?)__/g, '<b>$1</b>');
   text = text.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<i>$1</i>');
@@ -151,7 +168,14 @@ export function markdownToTelegramHtml(md) {
     text = text.replace(/(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/g, '<i>$1</i>');
   }
   text = text.replace(/~~(.+?)~~/g, '<s>$1</s>');
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => {
+    // Only safe schemes, and escape quotes — an unescaped `"` let a crafted
+    // URL break out of the href attribute (bad entities → message dropped).
+    const href = url.trim();
+    if (!/^(?:https?:|tg:|telegram:\/\/)/i.test(href)) return label;
+    return `<a href="${href.replace(/"/g, '&quot;')}">${label}</a>`;
+  });
+  text = text.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[Number(i)] ?? '');
 
   return text;
 }
@@ -195,7 +219,7 @@ function shortIdCore(id) {
  * Map each session id to a short `s-xxxx` display handle.
  * Length grows (4 → 6 → 8 …) only for prefixes that collide with another id,
  * so ids stay short while remaining unambiguous.
- * @returns {Map<string, string>} original id → display handle
+ * @returns {Map<string, { short: string, core: string }>} original id → handle + hex core
  */
 export function sessionShortIds(ids) {
   const cores = new Map(); // id → { core, tail }
@@ -206,6 +230,7 @@ export function sessionShortIds(ids) {
     cores.set(key, { core, tail: (core + key.replace(/[^0-9a-z]/gi, '').toLowerCase()) });
   }
   const out = new Map();
+  const used = new Set();
   for (const [id, { core, tail }] of cores) {
     let len = Math.min(4, tail.length);
     let prefix = tail.slice(0, len);
@@ -213,7 +238,18 @@ export function sessionShortIds(ids) {
       len += 2;
       prefix = tail.slice(0, len);
     }
-    out.set(id, { short: `s-${prefix}`, core });
+    let short = `s-${prefix}`;
+    // Sanitized tails can still be IDENTICAL for distinct ids (case or
+    // punctuation variants) or empty (session-less agent) — the loop above
+    // cannot resolve those. Emit a unique handle instead of two rows sharing
+    // one `/use` target (which silently routed to whichever row came first).
+    if (!prefix || used.has(short)) {
+      let n = 2;
+      while (used.has(`s-${prefix || 'id'}-${n}`)) n += 1;
+      short = `s-${prefix || 'id'}-${n}`;
+    }
+    used.add(short);
+    out.set(id, { short, core });
   }
   return out;
 }
@@ -229,13 +265,20 @@ export function wrapDisplay(text, width, maxLines = 2) {
   if (!src) return [];
   const lines = [];
   let line = '';
+  // Track dropped content EXPLICITLY. Inferring truncation from
+  // `src.length > reconst.length` was unreliable: hard breaks insert spaces
+  // without consuming chars, so discarded text could go unmarked.
+  let dropped = false;
   const pushHard = (token) => {
     for (const ch of token) {
       const cw = ch.codePointAt(0) > 0x2e7f ? 2 : 1;
       if (displayWidth(line) + cw > width) {
         lines.push(line);
         line = '';
-        if (lines.length >= maxLines) return;
+        if (lines.length >= maxLines) {
+          dropped = true;
+          return;
+        }
       }
       line += ch;
     }
@@ -249,17 +292,23 @@ export function wrapDisplay(text, width, maxLines = 2) {
     if (line) {
       lines.push(line);
       line = '';
-      if (lines.length >= maxLines) break;
+      if (lines.length >= maxLines) {
+        dropped = true;
+        break;
+      }
     }
     pushHard(token);
-    if (lines.length >= maxLines) break outer;
+    if (lines.length >= maxLines) {
+      dropped = true;
+      break outer;
+    }
   }
   if (lines.length < maxLines && line) lines.push(line);
 
   // Truncate anything that spilled past the line budget with an ellipsis.
   if (lines.length >= maxLines) {
     const reconst = lines.slice(0, maxLines).join(' ');
-    if (src.length > reconst.length) {
+    if (dropped || src.length > reconst.length) {
       const last = lines[maxLines - 1];
       let cut = '';
       for (const ch of last) {

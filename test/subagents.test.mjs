@@ -250,13 +250,26 @@ await test('refresh pulls label + work from the live child session', () => {
   assert.equal(e.label, 'Audit config');
   assert.ok(e.work.startsWith('read'));
 });
-await test('refresh locks a child that left the running state', () => {
+await test('refresh locks a non-running child only after the grace window', () => {
+  // 'idle'/'inactive' is NOT a terminal status (a continuable child between
+  // turns) — it must not be collapsed to completed on the first sighting.
   const b = makeBoard({
     listAgents: () => [{ session: { id: 'c1', header: { origin: 'subagent' }, events: [] }, status: 'idle' }],
   });
   b.onStart({ id: 'c1' });
   b.refresh(undefined);
+  assert.equal(b.entries.get('c1').locked, false, 'non-terminal status stays open within grace');
+  b.refresh(undefined); b.refresh(undefined);
   assert.equal(b.entries.get('c1').status, 'completed');
+  assert.equal(b.entries.get('c1').locked, true, 'persistent non-running locks after grace');
+});
+await test('refresh locks a child with a terminal status immediately', () => {
+  const b = makeBoard({
+    listAgents: () => [{ session: { id: 'c1', header: { origin: 'subagent' }, events: [] }, status: 'error' }],
+  });
+  b.onStart({ id: 'c1' });
+  b.refresh(undefined);
+  assert.equal(b.entries.get('c1').status, 'error');
   assert.equal(b.entries.get('c1').locked, true);
 });
 await test('refresh grace: missing child locks after GRACE_TICKS', () => {

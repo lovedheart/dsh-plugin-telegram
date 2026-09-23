@@ -193,6 +193,9 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
   }
 
   function persist() {
+    // Re-resolve lazily: if the home dir was unknown at load() time a cached
+    // empty path would silently disable persistence forever.
+    if (!storePath) storePath = _path();
     if (!storePath) return;
     try {
       const dir = dirname(storePath);
@@ -212,8 +215,23 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
 
   load();
 
-  function checkAllow(ruleKey) {
-    return rules.has(String(ruleKey));
+  /**
+   * @param {string} ruleKey
+   * @param {string|null} [chatId] when given, the rule must belong to THIS
+   *   chat (a rule remembered in another chat never grants silently); rules
+   *   with no recorded chat stay global (legacy). Expired rules are dropped.
+   */
+  function checkAllow(ruleKey, chatId) {
+    const k = String(ruleKey);
+    const v = rules.get(k);
+    if (!v) return false;
+    if (RULE_TTL_MS > 0 && v.at && Date.now() - v.at > RULE_TTL_MS) {
+      rules.delete(k);
+      persist();
+      return false;
+    }
+    if (chatId != null && v.chatId != null && String(v.chatId) !== String(chatId)) return false;
+    return true;
   }
   function rememberAllow(ruleKey, chatId) {
     const k = String(ruleKey);
@@ -245,10 +263,18 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
     return n;
   }
 
-  return { checkAllow, rememberAllow, clearRule, listForChat, all, removeForChat };
+  // `listAll` is the documented name; `all` kept as a short alias.
+  return { checkAllow, rememberAllow, clearRule, listForChat, all, listAll: all, removeForChat };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Approval-card send retry policy.
+const CARD_SEND_MAX_ATTEMPTS = 5;
+const CARD_SEND_BACKOFF_BASE_MS = 1000;
+const CARD_SEND_BACKOFF_MAX_MS = 10_000;
+// "Always allow" grants are not eternal: they expire (lazy, on check).
+const RULE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * Create the approval answerer module.
@@ -293,6 +319,17 @@ export function createApprovalModule(deps) {
    * cleared by the time it is called).
    * @returns the outcome, or null if the key is unknown / already settled.
    */
+  function safeFormatResolved(p, outcome) {
+    // A missing/throwing formatter must never abort settling (the tool call
+    // would hang) — degrade to "no card edit" and log.
+    try {
+      return typeof deps.formatResolved === 'function' ? deps.formatResolved(p, outcome) : '';
+    } catch (err) {
+      deps.log?.('warn', `approval formatResolved failed: ${err?.message ?? err}`);
+      return '';
+    }
+  }
+
   function settle(key, outcome, { clickQueryId } = {}) {
     const p = pending.get(key);
     if (!p || p.outcome) return null;
@@ -304,7 +341,7 @@ export function createApprovalModule(deps) {
     pending.delete(key);
     // Edit the card into its resolved state (best-effort; the card may already
     // be gone on a chat the bot can't edit).
-    const resolved = deps.formatResolved(p, outcome);
+    const resolved = safeFormatResolved(p, outcome);
     if (p.cardMessageId && resolved) {
       Promise.resolve().then(() => deps.client.editMessageText(p.chatId, p.cardMessageId, resolved, 'HTML', undefined, { botId: p.botId }))
         .catch(() => { /* ignore */ });
@@ -327,11 +364,10 @@ export function createApprovalModule(deps) {
     // owning bot; legacy single-bot has botId undefined → same as before).
     const cid = String(ownership.chatId ?? '');
     const nkey = ownership.botId != null ? `${ownership.botId}::${cid}` : cid;
-    if (cid && nkey) {
-      if (autopilotNotified.has(nkey)) return; // already announced this autopilot cycle
-      autopilotNotified.add(nkey);
-    }
-    const text = `🤖 <b>Autopilot</b>：已自动批准工具授权 <code>${deps.escape(label)}</code>（全局权限模式，无人逐步把关）`;
+    if (autopilotNotified.has(nkey)) return; // already announced this autopilot cycle
+    autopilotNotified.add(nkey);
+    const esc = typeof deps.escape === 'function' ? deps.escape : (x) => String(x ?? '');
+    const text = `🤖 <b>Autopilot</b>：已自动批准工具授权 <code>${esc(label)}</code>（全局权限模式，无人逐步把关）`;
     Promise.resolve()
       .then(() => deps.client.sendMessage({
         chatId: ownership.chatId,
@@ -375,7 +411,9 @@ export function createApprovalModule(deps) {
     // Allow-always: if this rule was already remembered (the user tapped
     // "一直允许" for it before), approve immediately without posting a card.
     const ruleKey = approvalRuleKey(req?.toolName, req?.reason);
-    if (deps.checkAllow?.(ruleKey)) {
+    // Chat-scoped: a rule remembered by one chat must NOT silently approve
+    // the identical ask in another user's chat (cross-tenant grant).
+    if (deps.checkAllow?.(ruleKey, ownership.chatId)) {
       deps.log?.('info', `approval auto-allowed (allow-always) for rule "${ruleKey}" (chat ${ownership.chatId})`);
       return 'allowed-once';
     }
@@ -402,14 +440,22 @@ export function createApprovalModule(deps) {
     // Post the card (closes over `key` for the keyboard).
     let cardMessageId = null;
     {
+      const esc = typeof deps.escape === 'function' ? deps.escape : (x) => String(x ?? '');
       const text = buildApprovalCardText(
-        toolLabel(req?.toolName),
-        deps.escape(String(req?.reason ?? '')),
+        // toolLabel passes unknown tool names through RAW — escaping only
+        // `reason` let a crafted tool/plugin name inject HTML into the card.
+        esc(toolLabel(req?.toolName)),
+        esc(String(req?.reason ?? '')),
         deps.timeoutMs > 0 ? Math.round(deps.timeoutMs / 1000) : 0,
       );
       const keyboard = buildApprovalKeyboard(key);
-      const maxAttempts = 5;
       for (let attempt = 1; ; attempt++) {
+        // Observe cancellation BETWEEN attempts: a turn aborted mid-retry must
+        // not end up posting a card for a dead request.
+        if (req?.signal?.aborted) {
+          pending.delete(key);
+          return 'cancelled';
+        }
         try {
           const res = await deps.client.sendMessage({
             chatId: ownership.chatId,
@@ -422,13 +468,13 @@ export function createApprovalModule(deps) {
           cardMessageId = res?.messageId ?? null;
           break;
         } catch (err) {
-          if (attempt >= maxAttempts || !isTransientTelegramError(err)) {
-            deps.log('error', `approval card send to chat ${ownership.chatId} failed after ${attempt} attempt(s): ${err.message}`);
+          if (attempt >= CARD_SEND_MAX_ATTEMPTS || !isTransientTelegramError(err)) {
+            deps.log?.('error', `approval card send to chat ${ownership.chatId} failed after ${attempt} attempt(s): ${err.message}`);
             cardMessageId = null;
             break;
           }
-          const delayMs = Math.min(1000 * 2 ** attempt, 10_000);
-          deps.log('warn', `approval card send attempt ${attempt} failed (${err.message}); retrying in ${delayMs}ms`);
+          const delayMs = Math.min(CARD_SEND_BACKOFF_BASE_MS * 2 ** attempt, CARD_SEND_BACKOFF_MAX_MS);
+          deps.log?.('warn', `approval card send attempt ${attempt} failed (${err.message}); retrying in ${delayMs}ms`);
           await sleep(delayMs);
         }
       }
@@ -438,6 +484,13 @@ export function createApprovalModule(deps) {
       // Could not deliver the card — delegate so another answerer (e.g. web UI)
       // may still answer; otherwise the service fails closed.
       return next();
+    }
+    // The entry may have LEFT `pending` while the card was in flight
+    // (unload → cancelAll settled the promise). Arming timer/listeners for a
+    // dead entry would dangle them for the whole timeoutMs window.
+    if (entry.outcome || !pending.has(key)) {
+      if (entry.outcome) return entry.outcome;
+      return await promise;
     }
     entry.cardMessageId = cardMessageId;
 
@@ -451,7 +504,7 @@ export function createApprovalModule(deps) {
       if (req.signal.aborted) onAbort();
       else req.signal.addEventListener('abort', onAbort, { once: true });
     }
-    deps.log('info', `approval card posted for tool "${req?.toolName}" (chat ${ownership.chatId}, key ${key})`);
+    deps.log?.('info', `approval card posted for tool "${req?.toolName}" (chat ${ownership.chatId}, key ${key})`);
 
     const outcome = await promise;
     if (entry.onAbort && entry.abortSignal) {
@@ -464,6 +517,19 @@ export function createApprovalModule(deps) {
   function handleCallbackQuery(query) {
     const parsed = parseApprovalCallback(query?.data);
     if (!parsed) return false;
+    // Origin check: only honour the click when it happened IN THE CHAT that
+    // owns the pending card. A callback replayed/forwarded into another chat
+    // must not approve (or deny) a request living somewhere else.
+    const entry0 = pending.get(parsed.key);
+    if (entry0) {
+      const clickChat = String(query?.message?.chat?.id ?? '');
+      if (clickChat && String(entry0.chatId ?? '') && clickChat !== String(entry0.chatId)) {
+        Promise.resolve().then(() => deps.ackCallback?.(query?.id, '⛔ 请在原会话中操作'))
+          .catch(() => { /* ignore */ });
+        deps.log?.('warn', `approval callback for key ${parsed.key} clicked in chat ${clickChat} (owner ${entry0.chatId}) — ignored`);
+        return true;
+      }
+    }
     let outcome;
     if (parsed.action === 'deny') outcome = 'rejected';
     else {
@@ -497,7 +563,7 @@ export function createApprovalModule(deps) {
       p.outcome = outcome;
       if (p.timer) { try { clearTimeout(p.timer); } catch { /* ignore */ } }
       pending.delete(key);
-      const resolved = deps.formatResolved(p, outcome);
+      const resolved = safeFormatResolved(p, outcome);
       if (p.cardMessageId && resolved) {
         Promise.resolve().then(() => deps.client.editMessageText(p.chatId, p.cardMessageId, resolved, 'HTML', undefined, { botId: p.botId }))
           .catch(() => { /* ignore */ });
