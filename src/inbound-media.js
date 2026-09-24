@@ -59,7 +59,7 @@ export function sanitizeForNote(text, maxLen = 500) {
 
 /** Pick the largest size of a photo array (most detail), or null. */
 function pickLargestPhoto(message) {
-  const sizes = Array.isArray(message?.photo) ? message.photo.filter(Boolean) : null;
+  const sizes = Array.isArray(message?.photo) ? message.photo.filter(Boolean) : [];
   if (!sizes.length) return null;
   const area = (p) => (Number(p.width) || 0) * (Number(p.height) || 0);
   return sizes.reduce((a, b) => (area(b) > area(a) ? b : a));
