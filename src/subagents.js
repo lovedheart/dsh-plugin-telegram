@@ -242,7 +242,10 @@ function terminalReason(e, startWall, now) {
     : e.status === 'aborted' ? '被中止'
     : (e.status === 'cancelled' || e.status === 'canceled') ? '被取消'
     : '已完成';
-  const startMs = startWall[e.id];
+  // startWall is a Map in production (renderBoardText's default is a plain
+  // object for tests) — bracket access on a Map is always undefined, which
+  // silently dropped the "用时" suffix in every terminal row.
+  const startMs = (startWall && typeof startWall.get === 'function' ? startWall.get(e.id) : startWall?.[e.id]) ?? e.startedAt;
   const endMs = e.endedAt || now;
   if (startMs && endMs && endMs >= startMs) {
     const secs = Math.max(0, Math.round((endMs - startMs) / 1000));
@@ -313,6 +316,8 @@ export class SubagentBoard {
     this.lastFlushAt = 0;
     this.flushInFlight = false;
     this.dirty = false;
+    // Generation counter: bumped by teardown() to invalidate in-flight flushes.
+    this._gen = 0;
   }
 
   _entry(id) {
@@ -516,9 +521,11 @@ export class SubagentBoard {
     const windowOpen = now - this.lastFlushAt >= DEFAULT_THROTTLE_MS;
     // A missing/invalid id can never be "edited": it always needs a post,
     // even when the rendered text is unchanged (e.g. sendText once returned
-    // null, or a failed edit cleared the id).
+    // null, or a failed edit cleared the id). The throttle window still
+    // applies — otherwise a send that keeps failing re-posted the whole board
+    // every refresh tick (duplicate boards + 429 pressure).
     const needsPost = !(Number.isFinite(this.messageId) && this.messageId > 0);
-    if (!force && !needsPost && (!changed || !windowOpen)) {
+    if (!force && (!windowOpen || (!changed && !needsPost))) {
       // Remember we want to push this later (the ticker will retry).
       if (changed) this.dirty = true;
       return;
@@ -529,7 +536,20 @@ export class SubagentBoard {
     try {
       if (!(Number.isFinite(this.messageId) && this.messageId > 0)) {
         const id = await this.sendText(text, { disableNotification: true });
-        this.messageId = id != null ? Number(id) : null;
+        // sendText returns an ARRAY of message ids when the board text is
+        // chunked — Number([a,b]) is NaN, which left the id permanently
+        // invalid and re-posted the board every tick (flood + 429).
+        const first = Array.isArray(id) ? id[0] : id;
+        this.messageId = Number.isFinite(Number(first)) && Number(first) > 0 ? Number(first) : null;
+        // Teardown during the send: the posted message belongs to a RETIRED
+        // session. Delete it instead of adopting (and pinning) an orphan board.
+        if ((this._gen || 0) !== gen) {
+          if (this.messageId && this.deleteMessage) {
+            try { await this.deleteMessage(this.messageId); } catch { /* best-effort */ }
+          }
+          this.messageId = null;
+          return;
+        }
         if (this.messageId && this.pinEnabled) {
           try { await this.pin(this.messageId); } catch { /* best-effort */ }
         }

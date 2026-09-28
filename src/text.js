@@ -32,8 +32,11 @@ export function chunkText(text, maxSize) {
   const half = Math.floor(limit / 2);
   let rest = text;
 
-  while (rest.length > maxSize) {
-    const window = rest.slice(0, maxSize);
+  // Loop and window MUST use the clamped `limit`, not the raw maxSize: a bogus
+  // (negative/tiny) maxSize made slice() take nothing while the condition
+  // stayed true forever — an empty-chunk loop that starved the event loop.
+  while (rest.length > limit) {
+    const window = rest.slice(0, limit);
     // Scan the window, tracking code-fence parity. A split position is
     // "balanced" when the number of ``` fences in rest[0..pos] is even — then
     // the chunk has balanced fences and per-chunk HTML is well-formed.

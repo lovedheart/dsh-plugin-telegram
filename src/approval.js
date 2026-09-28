@@ -187,7 +187,13 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
           rules.set(r.key, { chatId: typeof r.chatId === 'string' ? r.chatId : (_defaultChat() || null), at: Number(r.at) || Date.now() });
         }
       }
-    } catch {
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        // A CORRUPT or unreadable store must be loud: silently starting empty
+        // and then overwriting the file on the next persist() lost all
+        // remembered rules without a trace.
+        log?.('warn', `allow-always store load failed (${storePath}): ${err?.message ?? err}`);
+      }
       rules = new Map(); // missing/corrupt → start empty
     }
   }
@@ -230,7 +236,14 @@ export function createAllowlistStore({ log, path: staticPath, filePath, defaultC
       persist();
       return false;
     }
-    if (chatId != null && v.chatId != null && String(v.chatId) !== String(chatId)) return false;
+    // Chat binding: when the ask HAS a chat context, the rule must belong to
+    // that chat — including rules stored with NO chat (legacy/unknown), which
+    // used to match EVERY chat, so a "一直允许" granted once in one chat auto
+    // approved the same tool everywhere. A chatless check (probe with no
+    // ownership context) keeps the legacy global match.
+    if (chatId != null) {
+      if (v.chatId == null || String(v.chatId) !== String(chatId)) return false;
+    }
     return true;
   }
   function rememberAllow(ruleKey, chatId) {

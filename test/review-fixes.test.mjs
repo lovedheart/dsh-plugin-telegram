@@ -16,7 +16,7 @@ import { createAllowlistStore, createApprovalModule, CALLBACK_PREFIX } from '../
 import { createQuestionModule } from '../src/questions.js';
 import { ProgressIndicator, summarizeToolArgs } from '../src/progress.js';
 import { TelegramClient, TelegramApiError } from '../src/client.js';
-import { SubagentBoard } from '../src/subagents.js';
+import { SubagentBoard, renderBoardText } from '../src/subagents.js';
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -388,6 +388,30 @@ const btnOf = (client, suffix) => {
   throw new Error(`no button ending in ${suffix}`);
 };
 
+// Same wiring but WITHOUT autopilot (interactive cards only).
+function qMakeModuleManual() {
+  const calls = { sends: [], edits: [], acks: [] };
+  let nextId = 5000;
+  const client = {
+    calls,
+    async sendMessage(opts) {
+      calls.sends.push(opts);
+      return { messageId: ++nextId, chatId: String(opts.chatId) };
+    },
+    async editMessageText(chatId, id, text, pm, kb) { calls.edits.push({ chatId, id, text, kb }); return true; },
+    async answerCallbackQuery(id, t) { calls.acks.push({ id, t }); return true; },
+  };
+  const mod = createQuestionModule({
+    log: () => {},
+    escape,
+    client,
+    ownership: (agent) => (String(agent?.session?.id ?? '').startsWith('telegram-') ? { chatId: '77', botId: 'a', threadId: null } : null),
+    isAutopilot: () => false,
+    timeoutMs: 0,
+  });
+  return { mod, client };
+}
+
 await test('multi-question autopilot takeover POSTS the missing submit card (no hang)', async () => {
   const { mod, client } = qMakeModule();
   const questions = [
@@ -552,6 +576,268 @@ await test('re-start resets epoch bookkeeping (missedTicks/grace)', () => {
   assert.equal(b.entries.get('c1').missedTicks, 0);
   b.refresh(undefined); b.refresh(undefined);
   assert.equal(b.entries.get('c1').locked, false, 'grace counted from the RESTART, not the original spawn');
+});
+
+// ---------------------------------------------------------------------------
+// Second review round (2026-09, v0.6.5) — regression pins.
+// ---------------------------------------------------------------------------
+console.log('second review round (v0.6.5):');
+
+await test('chunkText with fractional / tiny maxSize still terminates', () => {
+  const long = 'x'.repeat(500);
+  const a = chunkText(long, 10.7);
+  assert.ok(a.length > 1 && a.length < 200, `a=${a.length}`); // terminated, not stuck
+  assert.ok(a.join('').replace(/```/g, '').length >= long.length - 20);
+  const b = chunkText(long, 0); // || fallback to the default limit
+  assert.ok(b.length >= 1);
+  const c = chunkText(long, 3); // clamped floor: splits at half of 8 = 4
+  assert.ok(c.length <= Math.ceil(500 / 4) + 1, `c=${c.length}`);
+});
+
+await test('_capTrace shrinks an object-valued tool args block (no per-tick re-stringify)', () => {
+  const ind = new ProgressIndicator({
+    chatId: '1', client: {}, log: () => {}, delayMs: 0, tickMs: 10_000, intervalMs: 1, timeoutMs: 60_000,
+    startedAt: Date.now(), perBlockChars: 40, trailLines: 3,
+  });
+  ind._addTool('bash', { command: 'y'.repeat(5000) });
+  assert.equal(typeof ind.trace[ind.trace.length - 1].args, 'string', 'args stored summarized, not raw');
+  assert.ok(ind.trace[ind.trace.length - 1].args.length <= 4000);
+  ind._capTrace();
+  const b = ind.trace[ind.trace.length - 1];
+  assert.equal(typeof b.args, 'string');
+  assert.ok(b.args.length <= 2000, `capped: ${b.args.length}`);
+});
+
+await test('buildTraceText caps an over-4096 maxChars (an endless failing edit was the freeze)', () => {
+  const ind = new ProgressIndicator({
+    chatId: '1', client: {}, log: () => {}, delayMs: 0, tickMs: 10_000, intervalMs: 1, timeoutMs: 60_000,
+    startedAt: Date.now(), streaming: true, maxChars: 100_000, trailLines: 3,
+  });
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'A'.repeat(50_000) } } });
+  assert.ok(ind.buildTraceText().length <= 4096, 'must never build an edit Telegram rejects');
+});
+
+await test('stop() awaits the in-flight trail edit BEFORE the final reply', async () => {
+  const order = [];
+  const client = {
+    async sendMessage() { return { messageId: 5 }; },
+    async editMessageText() { order.push('edit'); return true; },
+    async sendChatAction() { return true; },
+    async deleteMessage() { return true; },
+  };
+  const ind = new ProgressIndicator({
+    chatId: '1', client, log: () => {}, delayMs: 0, tickMs: 10_000, intervalMs: 1, timeoutMs: 60_000,
+    startedAt: Date.now(), streaming: true,
+    onFinalReply: async () => { order.push('final'); return true; },
+  });
+  await ind.ensureMessage();
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'hi' } } });
+  await ind.push(true); // records an in-flight edit
+  ind.endedByTurnEnd = true;
+  await ind.stop();
+  assert.deepEqual(order, ['edit', 'final'], 'no edit may land after the final reply rewrote the placeholder');
+});
+
+await test('stop() still DELIVERS the reply when onFinalReply throws', async () => {
+  const sends = [];
+  const client = {
+    async sendMessage(o) { sends.push(o.text); return { messageId: 5 }; },
+    async editMessageText() { return true; },
+    async sendChatAction() { return true; },
+    async deleteMessage() { return true; },
+  };
+  const ind = new ProgressIndicator({
+    chatId: '1', client, log: () => {}, delayMs: 0, tickMs: 10_000, intervalMs: 1, timeoutMs: 60_000,
+    startedAt: Date.now(), streaming: true,
+    onFinalReply: async () => { throw new Error('edit blew up'); },
+  });
+  await ind.ensureMessage();
+  ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'the answer' } } });
+  await ind.stop();
+  assert.ok(sends.some((t) => t.includes('the answer')), 'a plain fallback send must carry the reply');
+});
+
+await test('SubagentBoard flush adopts the FIRST id when sendText chunks', async () => {
+  const b = new SubagentBoard({
+    chatId: '1', log: () => {}, clock: () => Date.now(),
+    listAgents: () => [],
+    sendText: async () => [4242, 4243], // chunked post -> array
+    editText: async () => true,
+  });
+  b.onStart({ id: 'c1' });
+  await b.flush(true);
+  assert.equal(b.messageId, 4242, 'an array post used to become NaN and re-post every tick');
+});
+
+await test('renderBoardText reads a Map startWall without throwing', () => {
+  const startWall = new Map([['c1', 1000]]);
+  const out = renderBoardText([{ id: 'c1', status: 'done', label: 'x' }], { startWall, now: 5000 });
+  assert.ok(typeof out === 'string' && out.length, 'no [object Object] / throw');
+  assert.ok(!out.includes('[object'), out);
+});
+
+await test('allow-always rule stored WITHOUT a chat never grants in a chat', () => {
+  const store = createAllowlistStore({ log: () => {} });
+  store.rememberAllow('tool:bash', null); // e.g. defaultChatId was unset
+  assert.equal(store.checkAllow('tool:bash', '999'), false, 'a chatless rule must NOT auto-approve in an unrelated chat');
+  assert.equal(store.checkAllow('tool:bash'), true, 'a chatless probe keeps the legacy global match');
+  store.rememberAllow('tool:bash', '999');
+  assert.equal(store.checkAllow('tool:bash', '999'), true);
+  assert.equal(store.checkAllow('tool:bash', '111'), false);
+});
+
+await test('autopilot bail clears pre-filled selections (no phantom 已选 card)', async () => {
+  const questions = [
+    { id: 'q1', question: 'A?', options: [{ label: 'a1', description: '' }] },
+    { id: 'q2', question: 'B?', options: [{ label: '', description: '' }] }, // unpicklable
+  ];
+  const { mod } = qMakeModule();
+  const p = mod.handleRequest({ questions, agent: { session: { id: 'telegram-clear' } } }, async () => { throw new Error('no'); });
+  p.catch(() => {});
+  await sleep(60);
+  const entry = [...mod.pending.values()].find((e) => !e.outcome);
+  if (entry) {
+    // Either autopilot fully adopted, or the selections were rolled back for
+    // the manual fallback — never a half-filled selection set.
+    const half = entry.autopilot !== true && entry.selections.size > 0 && entry.selections.size < questions.length;
+    assert.ok(!half, `stale partial selections: ${[...entry.selections.keys()]}`);
+  }
+  mod.cancelAll();
+  await p.catch(() => {});
+});
+
+await test('single-select custom answer carries ONLY custom', async () => {
+  const { mod, client } = qMakeModuleManual();
+  const p = mod.handleRequest(
+    { questions: [{ id: 'q1', question: 'A?', multiSelect: false, options: [{ label: 'a1', description: '' }] }], agent: { session: { id: 'telegram-c' } } },
+    async () => { throw new Error('no'); },
+  );
+  p.catch(() => {});
+  await sleep(30);
+  mod.consumeTextReply('77', 'a', 'free form answer');
+  const res = await p;
+  const a = res.answers[0];
+  assert.equal(a.custom, 'free form answer');
+  assert.deepEqual(a.selected, [], 'single-select must not send selected AND custom');
+});
+
+await test('question callback in a foreign chat does not settle', async () => {
+  const { mod, client } = qMakeModuleManual();
+  const p = mod.handleRequest(
+    { questions: [{ id: 'q1', question: 'A?', options: [{ label: 'a1', description: '' }] }], agent: { session: { id: 'telegram-f' } } },
+    async () => { throw new Error('no'); },
+  );
+  p.catch(() => {});
+  await sleep(30);
+  await mod.handleCallbackQuery({ id: 'c', data: btnOf(client, ':q0:0').callback_data, message: { chatId: '9999' } });
+  await sleep(20);
+  assert.equal(mod.pending.size, 1, 'still pending — foreign tap must not commit');
+  await mod.handleCallbackQuery({ id: 'c2', data: btnOf(client, ':q0:0').callback_data, message: { chatId: '77' } });
+  const res = await p;
+  assert.deepEqual(res.answers[0].selected, ['a1']);
+});
+
+await test('poller offset store key is sanitized (no path traversal)', () => {
+  const p = new TelegramPoller({}, { offsetKey: '../../../../etc/passwd' });
+  assert.ok(!p._offsetPath.includes('..'), p._offsetPath);
+  assert.ok(p._offsetPath.endsWith('.json'));
+});
+
+await test('_isConflictError survives a thrown non-object', () => {
+  const p = new TelegramPoller({}, {});
+  assert.equal(p._isConflictError('boom'), false);
+  assert.equal(p._isConflictError(null), false);
+  assert.equal(p._isConflictError({ message: 'conflict' }), true);
+  assert.equal(p._isFatalError({ errorCode: 401 }), true);
+  assert.equal(p._isFatalError(undefined), false);
+});
+
+await test('a permanent 401 stops the poll loop instead of hammering forever', async () => {
+  const p = new TelegramPoller({ async getUpdates() { throw Object.assign(new Error('Unauthorized'), { errorCode: 401, status: 401 }); } }, { offsetStorePath: join(tmp, 'off-401.json') });
+  p.start();
+  const t0 = Date.now();
+  while (p.running && Date.now() - t0 < 5000) await sleep(20);
+  assert.equal(p.running, false, '401 must end the loop (was: endless 10s retries)');
+});
+
+await test('handler work survives an enqueue-restart: offset commits after the handler', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const store = join(tmp, 'off-defer.json');
+  const p = new TelegramPoller({}, { offsetStorePath: store });
+  p.onMessage(async () => { await gate; });
+  const work = p._processUpdates([{ updateId: 9, message: { chatId: '1', messageId: 1, senderId: '1', text: 'hi' } }]);
+  assert.ok(Array.isArray(work) && work.length === 1, 'batch returns its handler promises');
+  p.lastOffset = 10;
+  let committed = false;
+  try { JSON.parse(readFileSync(store, 'utf8')); committed = true; } catch { /* not yet */ }
+  assert.equal(committed, false, 'offset must NOT be committed before the handler settles');
+  release();
+  await Promise.allSettled(work);
+  await p.drain();
+  p._saveOffset();
+  assert.equal(JSON.parse(readFileSync(store, 'utf8')).offset, 10);
+});
+
+await test('sendMessage forwards opts.signal so callers can abort a send', async () => {
+  const ac = new AbortController();
+  const restore = fakeFetch(async (_url, init) => {
+    if (init?.signal !== ac.signal) {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 1, chat: { id: '1' } } }) };
+    }
+    throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+  });
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: 'http://x' });
+  let threw = false;
+  try { await c.sendMessage({ chatId: '1', text: 'x', signal: ac.signal }); } catch { threw = true; }
+  restore();
+  assert.ok(threw, 'an aborted signal must reject the send');
+});
+
+await test('downloadFile rejects an unsafe Telegram file_path', async () => {
+  const body = { ok: true, result: { file_id: 'f', file_path: '../../../etc/passwd', file_size: 10 } };
+  const restore = fakeFetch(async () => ({
+    ok: true, status: 200,
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  }));
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: 'http://x' });
+  let msg = '';
+  try { await c.downloadFile('f', tmp); } catch (e) { msg = e.message; }
+  restore();
+  assert.ok(/unsafe file_path/.test(msg), msg);
+});
+
+await test('downloadFile drops a traversal-y extension', async () => {
+  const seen = [];
+  const meta = { ok: true, result: { file_id: 'f', file_path: 'photos/a.\x00sh', file_size: 3 } };
+  const restore = fakeFetch(async (url) => {
+    if (String(url).includes('/file/bot')) {
+      return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer, body: {}, headers: { get: () => '' } };
+    }
+    return { ok: true, status: 200, json: async () => meta, text: async () => JSON.stringify(meta) };
+  });
+  const c = new TelegramClient({ botToken: 'TK', baseUrl: 'http://x' });
+  let r;
+  try { r = await c.downloadFile('f', tmp); } catch (e) { seen.push(e.message); }
+  restore();
+  if (r) assert.ok(!/[\x00/]/.test(r.localPath.split('/').pop()), r.localPath);
+  assert.equal(seen.length, 0, seen.join());
+});
+
+await test('inbound photo name handed to attachments is a basename', async () => {
+  const bin = join(tmp, 'p3.bin');
+  const saved = [];
+  const m = createInboundMediaModule({
+    clientFor: () => ({ async downloadFile() { return { localPath: bin, fileName: '../../etc/evil.png' }; } }),
+    log: () => {},
+    inboundMediaDir: tmp,
+    inboundImageToModel: true,
+    ctx: { attachments: { async saveImage(x) { saved.push(x); return { mediaType: x.mediaType, bytes: x.data.length }; } } },
+  });
+  writeFileSync(bin, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0]));
+  await m.downloadAndDescribeInboundMedia('b', { photo: [{ fileId: 'f', width: 2, height: 2 }] });
+  assert.equal(saved[0].name, 'evil.png', 'attachments service must see a basename');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

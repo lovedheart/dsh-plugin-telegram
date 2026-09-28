@@ -113,7 +113,8 @@ export class ProgressIndicator {
     // A footer showing the latest step keeps it visibly moving.
     this.lastActivityKind = null;   // 'text' | 'reasoning' | 'tool'
     this.lastActivityName = '';
-    this.finalized = false;
+    // In-flight trail edit (push()) so stop() can await it before finalizing.
+    this._pushInflight = null;
     // Set true right before stop() when the stop was triggered by a turn/end
     // event (vs. preemption by a newer turn or the timeout cap). Decides whether
     // a failed turn should surface a notice to the phone.
@@ -126,7 +127,11 @@ export class ProgressIndicator {
     if (id) this.seenToolIds.add(id);
     this.lastActivityKind = 'tool';
     this.lastActivityName = String(name || 'tool');
-    this.trace.push({ kind: 'tool', name: String(name || 'tool'), args: args ?? '' });
+    // Normalize args to a capped STRING at record time: tool/call events carry
+    // `arguments` as a plain object, which was stored verbatim (pinning MBs)
+    // and re-JSON.stringify()d by every render tick.
+    const a = typeof args === 'string' ? args : summarizeToolArgs(args, 4000);
+    this.trace.push({ kind: 'tool', name: String(name || 'tool'), args: a });
     this._capTrace();
   }
 
@@ -150,10 +155,9 @@ export class ProgressIndicator {
     for (const b of this.trace) {
       if (b.kind === 'reasoning' && typeof b.text === 'string' && b.text.length > MAX_BLOCK_CHARS) {
         b.text = b.text.slice(-KEEP_CHARS);
-      } else if (b.kind === 'tool' && typeof b.args === 'string' && b.args.length > MAX_BLOCK_CHARS) {
-        // Tool args were kept VERBATIM for the whole turn — a base64 blob or
-        // huge write payload pinned megabytes and got re-walked every tick.
-        b.args = b.args.slice(-KEEP_CHARS);
+      } else if (b.kind === 'tool') {
+        if (typeof b.args !== 'string') b.args = summarizeToolArgs(b.args, KEEP_CHARS);
+        else if (b.args.length > MAX_BLOCK_CHARS) b.args = b.args.slice(-KEEP_CHARS);
       }
     }
   }
@@ -166,7 +170,11 @@ export class ProgressIndicator {
    */
   buildTraceText() {
     const per = this.o.perBlockChars ?? 240;
-    const max = this.o.maxChars ?? 1500;
+    // Validate: a bogus (non-finite/<=0) maxChars falls back to 1500, and a
+    // config > 4096 is capped — an over-4096 edit fails Telegram's hard limit
+    // on EVERY tick and freezes the trail.
+    const _max = Number(this.o.maxChars);
+    const max = Number.isFinite(_max) && _max > 0 ? Math.min(4096, Math.floor(_max)) : 1500;
     // Streaming reply (方案B): once the reply starts arriving, it dominates
     // the message — show its TAIL (newest text, like live typing),
     // tail-truncated to `maxChars`. Plain text so partial markdown never
@@ -189,8 +197,9 @@ export class ProgressIndicator {
         const body = reply.length > bodyMax ? '…' + reply.slice(-(bodyMax - 1)) : reply;
         const full = header + body + foot;
         // A large perBlockChars config can make the FOOTER alone overshoot;
-        // an over-4096 edit fails every time and freezes the trail. Clamp.
-        return full.length > max ? '…' + full.slice(-(max - 1)) : full;
+        // an over-4096 edit fails every time and freezes the trail. Clamp
+        // (max > 1 guard: slice(-0) would return the ENTIRE string).
+        return full.length > max ? (max > 1 ? '…' + full.slice(-(max - 1)) : full.slice(0, max)) : full;
       }
     }
     const parts = [];
@@ -292,16 +301,24 @@ export class ProgressIndicator {
     const now = Date.now();
     const text = this.buildTraceText();
     if (!force && (text === this.lastText || now - this.lastEditAt < throttleMs)) return;
-    try {
-      await this.o.client.editMessageText(this.o.chatId, this.msgId, text, undefined);
-      // Commit only on SUCCESS: committing before the edit made a failed
-      // edit permanent (text === lastText short-circuits every later tick —
-      // the classic "progress never updates" freeze).
-      this.lastEditAt = now;
-      this.lastText = text;
-    } catch (err) {
-      this.o.log?.('warn', `Progress indicator: edit failed: ${err.message}`);
-    }
+    const edit = this.o.client.editMessageText(this.o.chatId, this.msgId, text, undefined);
+    // Track the in-flight edit so stop() can await it before finalizing — an
+    // edit that lands AFTER onFinalReply rewrote the placeholder would leave
+    // the "回复（生成中）" trail on screen forever.
+    const tracked = Promise.resolve(edit)
+      .then(() => {
+        // Commit only on SUCCESS: committing before the edit made a failed
+        // edit permanent (text === lastText short-circuits every later tick —
+        // the classic "progress never updates" freeze).
+        this.lastEditAt = Date.now();
+        this.lastText = text;
+      })
+      .catch((err) => {
+        this.o.log?.('warn', `Progress indicator: edit failed: ${err?.message}`);
+      })
+      .finally(() => { if (this._pushInflight === tracked) this._pushInflight = null; });
+    this._pushInflight = tracked;
+    return tracked;
   }
 
   /** Refresh the "typing…" chat action at most once per 4 s. */
@@ -315,7 +332,13 @@ export class ProgressIndicator {
     // nothing" symptom). Pass throwOnFailure so a persistently broken channel
     // actually rejects (the client swallows the error otherwise); we track
     // consecutive failures so a persistent break is loud instead of invisible.
-    Promise.resolve(this.o.client.sendChatAction(this.o.chatId, 'typing', this.o.threadId, { throwOnFailure: true }))
+    let p;
+    try {
+      p = this.o.client.sendChatAction(this.o.chatId, 'typing', this.o.threadId, { throwOnFailure: true });
+    } catch (err) {
+      p = Promise.reject(err); // a SYNC throw must not escape into void tick()
+    }
+    Promise.resolve(p)
       .then(() => { this.typingFailStreak = 0; })
       .catch((err) => {
         this.typingFailStreak += 1;
@@ -385,13 +408,17 @@ export class ProgressIndicator {
    * (a turn/end was seen).
    */
   processEvents(events) {
+    let ended = false;
     for (const evt of events) {
       if (!evt || typeof evt.seq !== 'number' || evt.seq <= this.processedSeq) continue;
       this.processedSeq = evt.seq;
-      if (evt.type === 'turn/end') return true;
+      // Record the flag but keep folding: a trailing assistant/message that
+      // lands after turn/end still feeds finalReplyText (events are not
+      // guaranteed strictly ordered in every log encoding).
+      if (evt.type === 'turn/end') { ended = true; continue; }
       this.processEvent(evt);
     }
-    return false;
+    return ended;
   }
 
   /**
@@ -412,6 +439,10 @@ export class ProgressIndicator {
     if (this.stopped) return;
     this.stopped = true;
     try { if (this.loop) clearInterval(this.loop); } catch { /* ignore */ }
+    // Let any in-flight trail edit settle BEFORE finalizing: an edit landing
+    // after onFinalReply rewrote the placeholder would restore the "生成中"
+    // trail over the final answer.
+    try { await this._pushInflight; } catch { /* ignore */ }
     try {
       if (this.streaming && typeof this.o.onFinalReply === 'function') {
         const fullText = this.finalReplyText || this.replyText;
@@ -421,6 +452,7 @@ export class ProgressIndicator {
           // true when it consumed the placeholder so we don't delete it again.
           // A REJECT here must not skip the placeholder cleanup below — a
           // throw used to leave a permanent "回复（生成中）" on screen.
+          let delivered = true;
           try {
             const consumed = await this.o.onFinalReply(this.o.chatId, fullText, {
               messageThreadId: this.o.threadId,
@@ -429,6 +461,26 @@ export class ProgressIndicator {
             if (consumed && this.msgId) this.msgId = null;
           } catch (err) {
             this.o.log?.('warn', `Progress indicator: onFinalReply failed: ${err?.message ?? err}`);
+            delivered = false;
+          }
+          // The reply is the ONE user-visible payload of the turn. If the
+          // finalize callback failed (Telegram outage, HTML parse error,
+          // over-limit chunk send) falling through to the delete below lost
+          // the answer entirely — the phone showed nothing. Send it plain.
+          if (!delivered) {
+            try {
+              await this.o.client.sendMessage({
+                chatId: this.o.chatId,
+                text: tailOf(compactText(fullText), 3500),
+                messageThreadId: this.o.threadId,
+              });
+              if (this.msgId) {
+                try { await this.o.client.deleteMessage(this.o.chatId, this.msgId); } catch { /* ignore */ }
+                this.msgId = null;
+              }
+            } catch (err2) {
+              this.o.log?.('error', `Progress indicator: plain-reply fallback failed too: ${err2?.message ?? err2}`);
+            }
           }
         } else if (this.endedByTurnEnd && typeof this.o.onTurnError === 'function') {
           // The turn ended but produced no reply text — most likely a provider /
@@ -448,7 +500,9 @@ export class ProgressIndicator {
         return;
       }
       if (this.msgId) {
-        try { await this.o.client.editMessageText(this.o.chatId, this.msgId, '✅ 完成', undefined); } catch { /* ignore */ }
+        // No "✅ 完成" edit here: the delete follows immediately, so the edit
+        // was never actually seen yet still burned a round-trip against the
+        // per-message edit throttle (where it could race the delete).
         try { await this.o.client.deleteMessage(this.o.chatId, this.msgId); } catch { /* ignore */ }
         this.msgId = null;
       }
@@ -496,6 +550,11 @@ export class ProgressIndicator {
         return;
       }
       await this.push(false);
+      } catch (err) {
+        // No catch meant a malformed event or a sync client throw rejected a
+        // DISCARDED promise: silent unhandled rejection, frozen trail, and
+        // nothing in the log to diagnose.
+        this.o.log?.('warn', `Progress indicator: tick failed: ${err?.message ?? err}`);
       } finally {
         this._tickBusy = false;
       }

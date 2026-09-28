@@ -58,7 +58,9 @@ export class TelegramPoller {
       || join(process.env.HOME || process.env.USERPROFILE || '', '.dsh');
     // Distinct store per bot: two pollers sharing one path would clobber each
     // other's offset (last writer wins → replay or lost updates on restart).
-    const key = options.offsetKey || options.botId || 'default';
+    // The key lands in a FILENAME, so strip anything but safe chars — a botId
+    // like `../../etc/x` must never escape the DSH home directory.
+    const key = String(options.offsetKey || options.botId || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
     return join(dshHome, `telegram-poller-offset-${key}.json`);
   }
 
@@ -76,12 +78,16 @@ export class TelegramPoller {
 
   _saveOffset() {
     if (this.lastOffset === undefined) return;
+    // Monotonic: deferred batch commits may resolve out of order; a stale
+    // (lower) offset on disk would replay already-handled updates forever.
+    if (this._savedOffset !== undefined && this.lastOffset <= this._savedOffset) return;
     try {
       const dir = dirname(this._offsetPath);
       mkdirSync(dir, { recursive: true });
       const tmp = `${this._offsetPath}.tmp`;
       writeFileSync(tmp, JSON.stringify({ offset: this.lastOffset, at: Date.now() }));
       renameSync(tmp, this._offsetPath);
+      this._savedOffset = this.lastOffset;
     } catch {
       // Persistence is best-effort; a read-only host just loses the offset.
     }
@@ -149,6 +155,7 @@ export class TelegramPoller {
       if (this._chatQueues.get(chatKey) === tail) this._chatQueues.delete(chatKey);
     });
     this._inflight.add(tracked);
+    return tracked;
   }
 
   async _pollLoop(signal) {
@@ -166,16 +173,26 @@ export class TelegramPoller {
         if (signal.aborted) break;
 
         if (updates.length > 0) {
-          this._processUpdates(updates);
-          // Commit the offset only from a valid id; a bad id would serialize
-          // to `null` in the store and force a full backlog replay on restart.
+          const batchWork = this._processUpdates(updates);
+          // Advance the IN-MEMORY offset only from a valid id; a bad id would
+          // serialize to `null` in the store and force a full backlog replay
+          // on restart.
           let maxId = -1;
           for (const u of updates) {
             if (Number.isFinite(u?.updateId) && u.updateId > maxId) maxId = u.updateId;
           }
           if (maxId >= 0) {
             this.lastOffset = maxId + 1;
-            this._saveOffset();
+            // Persist the offset only AFTER this batch's handlers complete.
+            // Committing at enqueue time meant a crash mid-turn silently LOST
+            // the message (offset said "delivered"); deferring trades a rare
+            // duplicate on crash-restart (dedup set is fresh → at-least-once)
+            // for never losing a message.
+            if (batchWork && batchWork.length) {
+              void Promise.allSettled(batchWork).then(() => this._saveOffset()).catch(() => { /* ignore */ });
+            } else {
+              this._saveOffset();
+            }
           } else {
             this._log('warn', 'getUpdates returned updates without valid update_ids; offset not advanced');
           }
@@ -188,6 +205,11 @@ export class TelegramPoller {
       } catch (err) {
         if (signal.aborted || !this.running) break;
 
+        if (this._isFatalError(err)) {
+          this._log('error', 'Permanent auth failure (401 Unauthorized) — polling stopped. Check the botToken config and reload the plugin.');
+          this.running = false;
+          break;
+        }
         if (this._isConflictError(err)) {
           this.conflictCount++;
           this.networkErrorCount = 0;
@@ -238,6 +260,11 @@ export class TelegramPoller {
     }
   }
 
+  /**
+   * Dispatch one getUpdates batch. Returns the array of enqueued handler
+   * promises so the poll loop can DEFER the offset commit until this batch's
+   * handlers settle (crash before handling ≠ lost message).
+   */
   _processUpdates(updates) {
     // IMPORTANT: handler work is ENQUEUED, never awaited here. A handler that
     // stalls on a hung/flaky Telegram call (see the per-request timeout in
@@ -245,6 +272,7 @@ export class TelegramPoller {
     // deaf during a long task" bug. Unlike the old fire-and-forget dispatch,
     // per-chat queues keep message order and every rejection (also after
     // internal awaits) is caught — no unhandledRejection can kill the process.
+    const work = [];
     for (const update of updates) {
       try {
         const msg = update.message || update.editedMessage;
@@ -290,23 +318,24 @@ export class TelegramPoller {
           }
           this._seenMessageIds.add(key);
 
-          this._enqueue(`c:${msg.chatId}`, () => Promise.all(
+          work.push(this._enqueue(`c:${msg.chatId}`, () => Promise.all(
             this.messageHandlers.map((h) => h(msg)),
-          ));
+          )));
         }
 
         if (update.callbackQuery && this.callbackHandlers.length > 0) {
           // Serialize callbacks into the SAME chat queue so a button tap can
           // never overtake (or be overtaken by) that chat's messages.
           const cbChat = update.callbackQuery.chatId ?? update.callbackQuery.message?.chatId ?? 'cb';
-          this._enqueue(`c:${cbChat}`, () => Promise.all(
+          work.push(this._enqueue(`c:${cbChat}`, () => Promise.all(
             this.callbackHandlers.map((h) => h(update.callbackQuery)),
-          ));
+          )));
         }
       } catch (err) {
         this._log('error', 'Error processing update:', err);
       }
     }
+    return work;
   }
 
   _resetRetryState() {
@@ -317,8 +346,11 @@ export class TelegramPoller {
   _isConflictError(err) {
     // Structured detection first (from the parsed Telegram error body):
     if (err?.errorCode === 409 || err?.status === 409) return true;
-    const text = String(err.message || '').toLowerCase();
-    const details = String(err.details || '').toLowerCase();
+    // `err` may be a string / null thrown by anything upstream — an unguarded
+    // err.message throw here rejected _pollLoop and left `running` true with
+    // no loop (the deaf-bot failure mode).
+    const text = String(err?.message ?? err ?? '').toLowerCase();
+    const details = String(err?.details ?? '').toLowerCase();
     const combined = text + ' ' + details;
     return (
       combined.includes('terminated by other getupdates request') ||
@@ -330,8 +362,18 @@ export class TelegramPoller {
   _isRateLimitError(err) {
     if (err instanceof TelegramRateLimitError) return true;
     if (err?.errorCode === 429 || err?.status === 429) return true;
-    const text = String(err.message || '').toLowerCase();
+    const text = String(err?.message ?? err ?? '').toLowerCase();
     return text.includes('too many requests') || text.includes('rate limit');
+  }
+
+  /**
+   * Permanent auth/config failures: retrying changes nothing. A revoked or
+   * deleted bot token (401) or a bad-bot-name 400 used to hammer the API at a
+   * fixed 10s cadence FOREVER, flooding the log. Stop the loop instead; the
+   * operator fixes the token and restarts the plugin.
+   */
+  _isFatalError(err) {
+    return err?.errorCode === 401 || err?.status === 401;
   }
 
   _isNetworkError(err) {
