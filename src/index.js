@@ -3809,15 +3809,29 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
             // Same lookup the `skill` tool uses: the chat's agent scopes the
             // layer chain, its session cwd selects project roots — so the
             // list matches what that agent can actually load.
-            const cwd = active?.session?.header?.cwd ?? process.cwd();
+            // A `signal` is NOT optional here: a provider whose list() blocks
+            // (e.g. a slow/odd cwd scan) would otherwise hang this handler
+            // forever — no reply, no error, silent. 10 s cap; dsh-skill races
+            // it against every provider and rejects on abort.
+            // `||` not `??`: the systemd unit has an EMPTY WorkingDirectory,
+            // so header.cwd can be '' — an empty cwd handed to the providers
+            // scans from '/' (or worse). Fall back to the process cwd instead.
+            const cwd = String(active?.session?.header?.cwd ?? '').trim() || process.cwd();
+            const t0 = Date.now();
+            log('info', `/skills: listing (cwd=${cwd}, scope=${active ? 'agent' : 'none'})`);
             let summaries;
             try {
-              summaries = await skillsSvc.list({ cwd, scope: active ?? undefined });
+              summaries = await skillsSvc.list({
+                cwd,
+                scope: active ?? undefined,
+                signal: AbortSignal.timeout(10_000),
+              });
             } catch (err) {
-              log('warn', `skills.list failed: ${err?.message ?? err}`);
-              await reply(`❌ 读取 skill 列表失败：${escapeHtml(err?.message ?? String(err))}`);
+              log('warn', `skills.list failed after ${Date.now() - t0}ms: ${err?.message ?? err}`);
+              await reply(`❌ 读取 skill 列表失败（${Math.round((Date.now() - t0) / 1000)}s）：${escapeHtml(err?.message ?? String(err))}`);
               return true;
             }
+            log('info', `/skills: ${summaries?.length ?? 0} skills in ${Date.now() - t0}ms`);
             await reply(escapeHtml(formatSkillCatalog(summaries, args || '')));
             return true;
           }
