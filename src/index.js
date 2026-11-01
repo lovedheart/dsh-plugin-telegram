@@ -3806,6 +3806,15 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
               await reply('❌ skill 服务不可用（该部署未挂载 dsh-skill）。');
               return true;
             }
+            // Ensure a routed agent BEFORE listing. `scope: undefined` shows
+            // the GLOBAL layer only (a handful of skills); the project /
+            // workspace-layer skills (matlab-*, simulink-*, roadrunner-*)
+            // live in the agent's layer chain — mounted by its preset and by
+            // the workspace its session is attached to. A fresh (bot, chat)
+            // with no routed agent would otherwise see the global stub list.
+            // ensureChatAgent mirrors the inbound-message auto-create, so
+            // this is exactly the agent the next plain message will run.
+            const skillsAgent = active ?? await ensureChatAgent(botId, chatId);
             // Same lookup the `skill` tool uses: the chat's agent scopes the
             // layer chain, its session cwd selects project roots — so the
             // list matches what that agent can actually load.
@@ -3816,14 +3825,14 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
             // `||` not `??`: the systemd unit has an EMPTY WorkingDirectory,
             // so header.cwd can be '' — an empty cwd handed to the providers
             // scans from '/' (or worse). Fall back to the process cwd instead.
-            const cwd = String(active?.session?.header?.cwd ?? '').trim() || process.cwd();
+            const cwd = String(skillsAgent?.session?.header?.cwd ?? '').trim() || process.cwd();
             const t0 = Date.now();
-            log('info', `/skills: listing (cwd=${cwd}, scope=${active ? 'agent' : 'none'})`);
+            log('info', `/skills: listing (cwd=${cwd}, scope=${skillsAgent ? 'agent' : 'none'})`);
             let summaries;
             try {
               summaries = await skillsSvc.list({
                 cwd,
-                scope: active ?? undefined,
+                scope: skillsAgent ?? undefined,
                 signal: AbortSignal.timeout(10_000),
               });
             } catch (err) {
