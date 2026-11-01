@@ -57,7 +57,7 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `/autopilot` | 全自动模式（`on`/`off`/`status`）：全局写权限 + 自动放行授权 + 自动采纳推荐方案（⚠️ 有安全隐患） |
 | `/plan` | 计划模式（`[需求描述|off|status]`）：只读调研 + 出方案，agent 用 `exit_plan_mode` 发方案给你审批（Approve / Keep planning 卡片），批准后才执行。带需求描述 = 进入并直接开始规划该需求 |
 | `/goal` | 长任务目标（`<目标>` 创建 / 空参查看 / `edit <目标>` / `pause` / `resume` / `clear`）；goal 激活后会话自动续跑轮次直到完成 |
-| `/skills [关键词]` | 列出当前会话可加载的 skill（名称/描述过滤，超 60 条折叠）；想让 agent 用哪个，直接发消息说即可 |
+| `/skills [关键词]` | 列出当前会话可加载的 skill（空参 = **完整列表**按族分组；带关键词 = 匹配项含说明）；想让 agent 用哪个，直接发消息说即可 |
 | `/start` 或 `/help` | 显示帮助 |
 
 普通消息路由到当前聊天的 active 会话；无显式路由时落到默认（第一个）会话。

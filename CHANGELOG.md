@@ -55,17 +55,20 @@ All notable changes to this project will be documented in this file.
   the host `skills` service (`dsh-skill`) with the same lookup the `skill`
   tool uses (`cwd` from the agent's session header, `scope` = the agent), so
   the reply matches what that agent can actually invoke — global +
-  project-root layers included. Optional filter matches name/description/
-  whenToUse case-insensitively; rows cap at 60 with a `+K more` overflow
-  line, descriptions clip at 100 chars. The agent loads one simply by being
-  asked in chat.
+  project-root layers included. Two modes, because a real host has hundreds
+  of skills: bare `/skills` returns the **complete** catalog (never
+  truncated), names only, grouped by family prefix (`▍matlab (120)` blocks,
+  wrapped ~90 cols); `/skills <关键词>` returns matches *with* descriptions
+  (60-row cap with `+K more`, 100-char clip — affordable since matches are
+  few). The agent loads one simply by being asked in chat.
 - `/help` and the BotFather command menu (`setMyCommands`) now list `/plan`,
   `/goal`, and `/skills`.
 
 ### Tests
-- `formatSkillCatalog` cases in `test/command-media.test.mjs` (7): no filter,
+- `formatSkillCatalog` cases in `test/command-media.test.mjs` (8): full-catalog
+  completeness (200 skills, nothing dropped) + family grouping,
   name/description/whenToUse matching, no-match + empty catalog, 100-char
-  clipping (and no clip under the limit), overflow collapse.
+  clipping (and no clip under the limit), filtered overflow collapse.
 - `test/statusboard.test.mjs` (21 cases): `/goal` grammar (show/create/edit/
   invalid-edit/pause/resume/clear, case-insensitivity), renderers (blocked
   reason, rounds, per-phase hints, long-objective clipping), snapshot

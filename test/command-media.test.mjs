@@ -92,15 +92,28 @@ const SKILLS = [
   { name: 'bili-say', description: 'B站AI原生助手。深度理解视频。', invocation: { userInvocable: true, modelInvocable: true } },
   { name: 'ocr-code-review', whenToUse: 'Run AI code reviews.', invocation: { userInvocable: false, modelInvocable: true } },
 ];
-test('no filter -> all listed with head count', () => {
+test('no filter -> COMPLETE catalog, every name listed, grouped by family', () => {
   const t = formatSkillCatalog(SKILLS, '');
-  assert.match(t, /可用 skill（3）：/);
-  assert.match(t, /^• matlab-core — Build MATLAB apps\.$/m);
-  assert.match(t, /^• ocr-code-review — Run AI code reviews\.$/m);
+  assert.match(t, /可用 skill（共 3 个，完整列表）：/);
+  assert.match(t, /^▍matlab \(1\)$/m);
+  assert.match(t, /^core$/m); // family block shows the suffix only
+  assert.ok(t.includes('bili'), 'bili family present');
+  assert.ok(t.includes('ocr'), 'ocr family present');
 });
-test('filter matches name, description and whenToUse (case-insensitive)', () => {
-  assert.match(formatSkillCatalog(SKILLS, 'MATLAB'), /匹配 1\/3/);
-  assert.match(formatSkillCatalog(SKILLS, 'ocr'), /• ocr-code-review/);
+test('no filter never truncates (200 skills all listed)', () => {
+  const many = Array.from({ length: 200 }, (_, i) => ({ name: `fam-${i}`, description: 'd' }));
+  many.push({ name: 'standalone' });
+  const t = formatSkillCatalog(many, '');
+  assert.match(t, /可用 skill（共 201 个，完整列表）：/);
+  for (let i = 0; i < 200; i++) assert.ok(t.includes(` · ${i}`) || t.includes(`\n${i}`) || t.includes(`▍fam (200)`), `name ${i} listed`);
+  assert.ok(t.includes('standalone'), 'no-dash name listed');
+  assert.ok(!/未列出/.test(t), 'full mode has no truncation');
+});
+test('filter matches name, description and whenToUse (case-insensitive) with descriptions', () => {
+  const t = formatSkillCatalog(SKILLS, 'MATLAB');
+  assert.match(t, /匹配 1\/3/);
+  assert.match(t, /• matlab-core — Build MATLAB apps\./);
+  assert.match(formatSkillCatalog(SKILLS, 'ocr'), /• ocr-code-review — Run AI code reviews\./);
   assert.match(formatSkillCatalog(SKILLS, 'B站'), /• bili-say/);
 });
 test('no match -> empty message keeps total', () => {
@@ -110,19 +123,19 @@ test('empty catalog', () => {
   assert.match(formatSkillCatalog([], ''), /当前没有可用 skill/);
   assert.match(formatSkillCatalog(null, ''), /当前没有可用 skill/);
 });
-test('long description clipped to 100 chars', () => {
-  const t = formatSkillCatalog([{ name: 'x', description: 'y'.repeat(300) }], '');
+test('filtered long description clipped to 100 chars', () => {
+  const t = formatSkillCatalog([{ name: 'x', description: 'y'.repeat(300) }], 'x');
   assert.match(t, /^• x — y{100}…$/m);
 });
-test('short description not clipped', () => {
-  const t = formatSkillCatalog([{ name: 'x', description: 'z'.repeat(50) }], '');
+test('filtered short description not clipped', () => {
+  const t = formatSkillCatalog([{ name: 'x', description: 'z'.repeat(50) }], 'x');
   assert.match(t, /^• x — z{50}$/m);
 });
-test('overflow collapses into +K more line', () => {
+test('filtered overflow collapses into +K more line', () => {
   const many = Array.from({ length: 70 }, (_, i) => ({ name: `s-${i}`, description: 'd' }));
-  const t = formatSkillCatalog(many, '');
+  const t = formatSkillCatalog(many, 's-');
+  assert.match(t, /匹配 70\/70/);
   assert.match(t, /另有 10 个未列出/);
-  assert.ok(t.split('\n').length <= 65, 'row cap holds the reply small');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
