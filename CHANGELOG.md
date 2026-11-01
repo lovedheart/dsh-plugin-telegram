@@ -2,6 +2,67 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-11-01
+
+### Added
+- **`/plan` — plan mode on Telegram.** Bridges the host `planMode` service
+  (`dsh-plan-mode`): `/plan` (or `on`) enters, `/plan off` leaves,
+  `/plan status` reports `{active, pending}`. `/plan <需求描述>` enters *and*
+  forwards the description (`followup`) so the agent immediately starts
+  planning it — parity with the web `/plan [off|message]`. While active the
+  agent works read-only and presents its plan via `exit_plan_mode`, which
+  arrives as an ordinary question card (the full plan markdown rides in the
+  question's `detail`, already rendered by the existing cards): **Approve**
+  leaves plan mode and executes from the next step, **Keep planning** or a
+  free-text answer returns feedback to the model. All four service outcomes
+  are narrated distinctly (`committed` / `queued` = "下一步生效" /
+  `cancelled` / `noop`). Fallback when no `planMode` service is mounted (e.g.
+  the minimal preset): append `plan/mode` straight onto the session — the same
+  write path the service's between-turn branch uses — reported as `appended`.
+- **`/goal` — durable session goals on Telegram.** Mirrors
+  `@deepseek-ai/dsh-command-goal` over the host `goals` service: bare
+  `/goal` shows, `/goal <objective>` creates (and arms), `/goal edit
+  <objective>`, `pause`, `resume`, `clear`. Replies match the web output —
+  phase (进行中/已暂停/受阻/已完成 + the raw phase), blocker
+  `code + message`, objective, `roundsStarted/maxGoalRounds`, activation
+  (armed/disarmed), and the state-accurate command hint. Compare-and-set uses
+  the exact `{id, revision}` ref; a `GoalError` (already exists, exhausted
+  rounds, bad transition, stale revision) surfaces its own message plus usage.
+- **Pinned status board (📌) — the chat's modes are always visible and
+  correct.** One pinned message per (bot, chat) folding **plan mode** (with a
+  pending change), **goal** (phase / objective / rounds), and **autopilot**
+  into one snapshot. New `src/statusboard.js` (`StatusBoard` +
+  `renderStatus` + the `/goal` grammar and renderers, dependency-free and
+  unit-tested).
+  - **Correct updates everywhere**: refreshed inline right after `/plan`,
+    `/goal`, `/autopilot on|off` and `/use`, and torn down (unpin + delete) on
+    `/new`; a `statusBoardRefreshMs` ticker (default 5 s) re-folds every routed
+    chat so *agent-side* transitions stay current — goal rounds ticking,
+    `exit_plan_mode` approved, goal completed/blocked, or a change made from
+    the web plane.
+  - **Never stale, never noisy**: a neutral chat (plan off + no goal +
+    autopilot off) pins nothing and self-cleans an existing board; unchanged
+    text never re-edits (idempotent refresh); the snapshot is re-read from the
+    services on every refresh, never cached from a command reply.
+  - **Same resilience contract as the subagent board**: an externally deleted
+    status message is re-posted (and re-pinned) on the next refresh; teardown
+    bumps a generation counter so an in-flight send deletes its own orphan
+    instead of pinning it; pin/edit failures (bot not admin, 429) degrade to
+    best-effort. Cleared on unload with the pinned messages unpinned.
+  - Config: `statusBoardEnabled` (default `true`), `statusBoardPin`
+    (default `true`), `statusBoardRefreshMs` (default `5000`).
+- `/help` and the BotFather command menu (`setMyCommands`) now list `/plan`
+  and `/goal`.
+
+### Tests
+- `test/statusboard.test.mjs` (21 cases): `/goal` grammar (show/create/edit/
+  invalid-edit/pause/resume/clear, case-insensitivity), renderers (blocked
+  reason, rounds, per-phase hints, long-objective clipping), snapshot
+  meaningfulness, and the board lifecycle — first send+pin, unchanged = no-op,
+  in-place edit without re-pin, re-post after external deletion, teardown on
+  neutral, orphan deletion on teardown-during-send, pin failure and
+  `pinEnabled: false`. Full suite: 13 files, 348 pass.
+
 ## [0.6.5] - 2026-09-15
 
 ### Fixed

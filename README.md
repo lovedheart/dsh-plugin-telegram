@@ -14,6 +14,8 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 - **Agent integration**: Inject Telegram messages into DSH agent loop for AI-powered conversations
 - **Multi-bot**: run several Telegram bots in one plugin instance (`bots:` config, per-bot tokens/routing, isolated state)
 - **Live subagent board**: pinned real-time subagent status (🧩) per chat
+- **Pinned status board**: one pinned message per chat folding plan mode / goal / autopilot into a single 📌
+- **`/plan` + `/goal`**: Telegram counterparts of the web plan mode and durable session goals
 - **`/autopilot`**: per-chat fully-autonomous mode (global write + auto-approve + auto-adopt)
 - **Access control** via allowed chats/users lists
 - **Automatic reconnection** with exponential backoff
@@ -53,6 +55,8 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `/model <provider>:<model>` | 为当前会话切换模型（下一轮请求生效） |
 | `/approval` | 查看已记住的「一直允许」授权（`/approval clear` 清空全部，`/approval <ruleKey>` 清单条） |
 | `/autopilot` | 全自动模式（`on`/`off`/`status`）：全局写权限 + 自动放行授权 + 自动采纳推荐方案（⚠️ 有安全隐患） |
+| `/plan` | 计划模式（`[需求描述|off|status]`）：只读调研 + 出方案，agent 用 `exit_plan_mode` 发方案给你审批（Approve / Keep planning 卡片），批准后才执行。带需求描述 = 进入并直接开始规划该需求 |
+| `/goal` | 长任务目标（`<目标>` 创建 / 空参查看 / `edit <目标>` / `pause` / `resume` / `clear`）；goal 激活后会话自动续跑轮次直到完成 |
 | `/start` 或 `/help` | 显示帮助 |
 
 普通消息路由到当前聊天的 active 会话；无显式路由时落到默认（第一个）会话。
@@ -226,6 +230,9 @@ dsh web --patch ./cordis.yml
 | `subagentBoardRefreshMs` | number | `2000` | How often the board re-reads live child sessions and re-renders (edits are throttled to ~1.5 s regardless). |
 | `subagentBoardIncludeDescendants` | boolean | `false` | When `true`, also show nested subagents (a subagent that spawns another). Default shows only direct children. |
 | `subagentBoardMaxRows` | number | `10` | Cap on subagents shown before the overflow collapses into a `… 另有 K 个未显示` line (keeps the message under Telegram's 4096-char limit). |
+| `statusBoardEnabled` | boolean | `true` | Keep ONE pinned status message per chat showing plan mode / goal / autopilot (📌). It appears only while something is active and self-removes when everything is off. See "Pinned status board" below. |
+| `statusBoardPin` | boolean | `true` | Pin the status message at the chat top. |
+| `statusBoardRefreshMs` | number | `5000` | Ticker cadence that re-folds the snapshot (agent-side goal rounds / `exit_plan_mode` change state without a Telegram command). Unchanged text never re-edits. |
 | `verbose` | boolean | `false` | Enable debug and info logs (default: errors only) |
 
 ### Multi-Bot Configuration
@@ -554,6 +561,48 @@ the agent should put its **recommended** option **first** and tag its label with
 instruction into every forwarded message (see [AGENT_INTEGRATION](AGENT_INTEGRATION.md)).
 `pickRecommended` locks on the `推荐`/`recommended` marker, else falls back to the
 first option.
+
+### Plan mode (`/plan`) & goals (`/goal`)
+
+The Telegram counterparts of the web UI's plan mode and durable session goals —
+thin bridges over the host services (`dsh-plan-mode`, `dsh-goal`), so state is
+shared with the web plane (a goal set from Telegram shows in the web sidebar
+and vice versa; `plan/mode` lives in the session projection, so resume/fork
+restore it).
+
+- **`/plan`** (no args) or `/plan on` enter plan mode; `/plan <需求描述>` also
+  forwards the description so the agent immediately starts planning it. The
+  agent then works read-only and calls `exit_plan_mode`, which arrives as a
+  normal question card carrying the full plan text — **Approve** leaves plan
+  mode and executes; **Keep planning** (or a free-text answer = custom) sends
+  feedback back. `/plan off` leaves, `/plan status` reads (including a pending
+  change that applies from the next step). If the deployment has no
+  `planMode` service (e.g. minimal preset), the plugin falls back to appending
+  `plan/mode` straight onto the session.
+- **`/goal <目标>`** creates (and arms) a durable goal — the session
+  auto-continues goal rounds until complete/blocked; `/goal` shows
+  phase/rounds/activation like the web command, `/goal edit <目标>` /
+  `pause` / `resume` / `clear` mirror it (compare-and-set on `{id, revision}`;
+  a stale revision fails with the service's own message).
+
+### Pinned status board (📌)
+
+One pinned message per chat that folds the chat's current modes into a single
+glanceable line-set: **plan mode** (incl. a pending change), **goal** (phase,
+objective, rounds), and **autopilot**. Rules:
+
+- **Appears only when something is active** (plan on / goal set / autopilot
+  on). A neutral chat never gets a pinned message; when everything turns off
+  the board unpins + deletes itself.
+- **Always correct**: refreshed inline right after `/plan`, `/goal`,
+  `/autopilot`, `/use`, and on `/new` (teardown), plus a slow
+  `statusBoardRefreshMs` ticker so *agent-side* changes (goal rounds ticking,
+  `exit_plan_mode` approved, goal completed) stay current. Unchanged text
+  never re-edits (idempotent, no Telegram spam).
+- Same resilience as the subagent board: an externally deleted status message
+  is re-posted; teardown invalidates in-flight edits so no orphan is pinned;
+  pin failure (bot not admin) degrades to an unpinned top message, never a
+  crash. Disable with `statusBoardEnabled: false`.
 
 ## Creating a Telegram Bot
 

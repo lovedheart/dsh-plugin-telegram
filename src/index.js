@@ -29,6 +29,10 @@ import {
 import { chunkText, markdownToTelegramHtml, guardConvertedLength, sessionShortIds, wrapDisplay } from './text.js';
 import { ProgressIndicator, summarizeToolArgs, tailOf, compactText } from './progress.js';
 import { SubagentBoard, DEFAULT_REFRESH_MS } from './subagents.js';
+import {
+  StatusBoard, renderStatus, parseGoalCommand, formatGoalReport,
+  phaseLabel, GOAL_USAGE,
+} from './statusboard.js';
 import { randomUUID } from 'node:crypto';
 
 // Re-export the indicator + its text helpers so existing importers (tests +
@@ -237,6 +241,14 @@ const defaults = {
   subagentBoardRefreshMs: 2000,   // cadence to re-read live child sessions
   subagentBoardIncludeDescendants: false, // show nested (depth>1) subagents too
   subagentBoardMaxRows: 10,       // collapse overflow into "+K more"
+  // Pinned status board (v0.7.0). ONE pinned message per chat showing the
+  // session's current modes — plan mode, goal (phase + rounds), autopilot.
+  // Appears only when something is active (plan on / goal set / autopilot on)
+  // and self-removes when everything is off; refreshed by a slow ticker so
+  // agent-side goal rounds update it too. See src/statusboard.js.
+  statusBoardEnabled: true,
+  statusBoardPin: true,           // pin the status message at the chat top
+  statusBoardRefreshMs: 5000,     // ticker cadence (changes also refresh inline)
   // Logging
   verbose: false,             // Enable debug and info logs (default: errors only)
 };
@@ -299,6 +311,9 @@ const schema = {
   subagentBoardRefreshMs: ['number'],
   subagentBoardIncludeDescendants: ['boolean'],
   subagentBoardMaxRows: ['number'],
+  statusBoardEnabled: ['boolean'],
+  statusBoardPin: ['boolean'],
+  statusBoardRefreshMs: ['number'],
   verbose: ['boolean'],
 };
 export const Config = {
@@ -594,6 +609,7 @@ export const botRegistry = new Map();
 // maps are cleared at the top of every apply() run (mirroring botRegistry) so
 // a reload starts clean and never carries a previous run's boards/indicators.
 export const subagentBoards = new Map(); // k(botId, chatId) -> SubagentBoard
+export const statusBoards = new Map(); // k(botId, chatId) -> StatusBoard (v0.7.0)
 export const activeIndicators = new Map(); // k(botId, chatId) -> ProgressIndicator
 // v0.5.x P5/P6: test-only access to the closure-scoped per-bot ownership +
 // board helpers. apply() overwrites these each run with THAT run's closures,
@@ -635,6 +651,7 @@ export async function apply(ctx, config) {
   // P6) so a previous run's boards/indicators never linger across a reload.
   botRegistry.clear();
   subagentBoards.clear();
+  statusBoards.clear();
   activeIndicators.clear();
 
   // v0.5.x P4 (tool layer): the optional `bot` parameter every send/media/edit/
@@ -808,6 +825,13 @@ export async function apply(ctx, config) {
   const subagentBoardIncludeDescendants = c.subagentBoardIncludeDescendants === true;
   const subagentBoardMaxRows = Math.max(1, Number(c.subagentBoardMaxRows) || 10);
 
+  // Pinned status board options (see src/statusboard.js). One pinned message
+  // per (bot, chat) showing plan mode / goal / autopilot; self-removes when
+  // nothing is active.
+  const statusBoardEnabled = c.statusBoardEnabled !== false;
+  const statusBoardPin = c.statusBoardPin !== false;
+  const statusBoardRefreshMs = Math.max(1000, Number(c.statusBoardRefreshMs) || 5000);
+
   // Streaming reply (方案B) — direct mode only. The reply is shown building in
   // place (placeholder edited as text-delta arrives) and finalized in place at
   // turn end (HTML render, or chunked send on overflow).
@@ -855,6 +879,10 @@ export async function apply(ctx, config) {
   let questionCancel = null;
   let questionHandleQuery = null;
   let questionConsumeText = null;
+  // Pinned status board (v0.7.0): the refresh ticker, set inside the polling
+  // block alongside the boards it drives; cleared + stopped by the unload
+  // effect below (hoisted here so that cleanup can see it).
+  let statusTicker = null;
 
   // Dedup set of injected Telegram message ids (in-memory; bounded by a cap
   // below so a long-running plugin can't leak memory).
@@ -3082,6 +3110,202 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
     }
 
     // ---------------------------------------------------------------------
+    // Goal / Plan mode + pinned status board (v0.7.0).
+    //
+    //   • /plan  — enter/leave plan mode through the host planMode service
+    //     (dsh-plan-mode). Its set(agent, active) returns committed|queued|
+    //     cancelled|noop and the state lives in the `plan` projection, so a
+    //     session reload restores it. Fallback when the service is missing
+    //     (e.g. minimal preset): append `plan/mode` straight onto the session
+    //     — the same write path the service's between-turn branch uses.
+    //   • /goal  — mirror of the web /goal command over the host goals service
+    //     (dsh-goal): show/create/edit/pause/resume/clear with compare-and-set
+    //     refs {id, revision}. Grammar + rendering live in statusboard.js.
+    //   • Status board — one pinned message per (bot, chat) folding plan mode,
+    //     the goal view, and autopilot into a single snapshot; appears only
+    //     while something is active, refreshed inline on command changes and by
+    //     a slow ticker (agent-side goal rounds / exit_plan_mode change state
+    //     without a Telegram command). See src/statusboard.js.
+    // ---------------------------------------------------------------------
+
+    // Fold plan/mode from a session's event log (last one wins) — used only
+    // when the planMode projection/service is unavailable.
+    function planModeFromEvents(agent) {
+      const events = sessionEvents(agent?.session);
+      if (!Array.isArray(events)) return null;
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i]?.type === 'plan/mode') return !!events[i].data?.active;
+      }
+      return null;
+    }
+
+    // {active, pending} for an agent; null when neither the service nor the
+    // session log knows (host without plan-mode mounted).
+    function planStatusOf(agent) {
+      const svc = ctx.get?.('planMode');
+      if (svc?.get && agent) {
+        try { return svc.get(agent) ?? null; } catch { /* fall through to log */ }
+      }
+      const logged = planModeFromEvents(agent);
+      return logged === null ? null : { active: logged, pending: undefined };
+    }
+
+    // Switch plan mode; returns the service outcome or 'appended' via the
+    // session fallback, 'unavailable' when neither path works.
+    function setPlanModeFor(agent, active) {
+      const svc = ctx.get?.('planMode');
+      if (svc?.set && agent) {
+        try { return svc.set(agent, active); } catch (err) {
+          log('warn', `planMode.set failed: ${err?.message ?? err}`);
+          return 'unavailable';
+        }
+      }
+      if (agent?.session?.append) {
+        try {
+          agent.session.append('plan/mode', { active });
+          return 'appended';
+        } catch (err) {
+          log('warn', `plan/mode append failed: ${err?.message ?? err}`);
+        }
+      }
+      return 'unavailable';
+    }
+
+    // Current goal view for an agent (or null). The goals service throws for
+    // non-live agents — never let the status board take down a command.
+    function goalStatusOf(agent) {
+      const svc = ctx.get?.('goals');
+      if (!svc?.get || !agent) return null;
+      try { return svc.get(agent) ?? null; } catch { return null; }
+    }
+
+    // One StatusBoard per (bot, chat), lazily created — mirrors boardForChat.
+    // The board's send/edit/pin bindings use the OWNING bot's client.
+    function statusBoardForChat(botId, chatId) {
+      const key = k(botId, chatId);
+      let b = statusBoards.get(key);
+      if (!b) {
+        const bClient = clientFor(botId);
+        const cid = String(chatId);
+        b = new StatusBoard({
+          chatId: cid,
+          pinEnabled: statusBoardPin,
+          sendText: (text, opts) => sendText(botId, cid, text, { ...opts, plain: true }),
+          editText: (messageId, text) => bClient.editMessageText(cid, messageId, text, undefined),
+          pin: (messageId) => bClient.pinChatMessage(cid, messageId),
+          unpin: (messageId) => bClient.unpinChatMessage(cid, messageId),
+          deleteMessage: (messageId) => bClient.deleteMessage(cid, messageId),
+          log: (level, ...args) => log(level, ...args),
+        });
+        statusBoards.set(key, b);
+      }
+      return b;
+    }
+
+    // Fold the (bot, chat)'s current modes into one snapshot.
+    function statusSnapshotFor(botId, chatId) {
+      const agent = chatAgentOf(botId, chatId);
+      const sid = String(agent?.session?.id ?? '');
+      const short = sid ? (sessionShortIds([sid]).get(sid)?.short ?? sid.slice(0, 12)) : '';
+      return {
+        sessionId: sid,
+        sessionShort: short,
+        plan: planStatusOf(agent),
+        goal: goalStatusOf(agent),
+        autopilot: !!autopilotStateFor(chatId, botId),
+      };
+    }
+
+    // Refresh (or tear down) one chat's pinned status message. Fire-and-forget.
+    function refreshStatusBoard(botId, chatId) {
+      if (!statusBoardEnabled || !clientFor || !client) return;
+      try {
+        const snap = statusSnapshotFor(botId, chatId);
+        const existing = statusBoards.get(k(botId, chatId));
+        if (!renderStatus(snap).meaningful && !existing) return; // nothing pinned, nothing to say
+        void statusBoardForChat(botId, chatId).refresh(snap).catch(() => {});
+      } catch (err) {
+        log('warn', `status board refresh failed: ${err?.message ?? err}`);
+      }
+    }
+
+    // Tear down one chat's status board (unpin + delete) — /new and unload.
+    async function teardownStatusBoardForChat(botId, chatId) {
+      const b = statusBoards.get(k(botId, chatId));
+      if (!b) return;
+      statusBoards.delete(k(botId, chatId));
+      try { await b.teardown(); } catch { /* best-effort */ }
+    }
+
+    // Ticker: keep every routed chat's pinned status in sync (agent-side goal
+    // rounds, exit_plan_mode approvals, web-plane changes all land here).
+    // Idempotent + no-op on unchanged text, so 5 s polling is free.
+    function tickStatusBoards() {
+      try {
+        for (const [key] of chatAgents) {
+          const bi = key.indexOf('::');
+          const botId = bi >= 0 ? key.slice(0, bi) : 'default';
+          const chatId = bi >= 0 ? key.slice(bi + 2) : key;
+          refreshStatusBoard(botId, chatId);
+        }
+      } catch (err) {
+        log('warn', `status board tick failed: ${err?.message ?? err}`);
+      }
+    }
+    if (statusBoardEnabled && client) {
+      statusTicker = setInterval(() => tickStatusBoards(), statusBoardRefreshMs);
+      try { if (typeof statusTicker.unref === 'function') statusTicker.unref(); } catch { /* ignore */ }
+    }
+
+    // /goal over the goals service — mirrors dsh-command-goal's handler.
+    // Returns the reply text (plain; caller escapes). `agent` is the chat's.
+    function handleGoalCommand(agent, rawArgs) {
+      const svc = ctx.get?.('goals');
+      if (!svc) return '❌ goal 服务不可用（该部署未挂载 dsh-goal）。';
+      if (!agent) return `❌ 没有可用会话。先 /new 新建会话。\n${GOAL_USAGE}`;
+      const command = parseGoalCommand(rawArgs);
+      const current = goalStatusOf(agent);
+      const ref = current ? { id: current.id, revision: current.revision } : null;
+      const render = (title, view) => formatGoalReport(title, view ?? goalStatusOf(agent));
+      try {
+        switch (command.kind) {
+          case 'show':
+            return current ? render('🎯 目标', current) : `（当前没有目标）\n${GOAL_USAGE}`;
+          case 'invalid-edit':
+            return `❌ edit 需要新的目标文本。\n${GOAL_USAGE}`;
+          case 'create': {
+            if (current && current.phase !== 'complete') {
+              return `❌ 已有${phaseLabel(current.phase)}的目标。先 /goal edit <目标> 修改，或 /goal clear 清除。`;
+            }
+            return render('🎯 目标已创建', svc.create(agent, { objective: command.objective }));
+          }
+          case 'edit': {
+            if (!current) return `❌ 没有目标可编辑。\n${GOAL_USAGE}`;
+            if (current.phase === 'complete') {
+              return render('🎯 目标已创建', svc.create(agent, { objective: command.objective }));
+            }
+            return render('🎯 目标已更新', svc.edit(agent, ref, { objective: command.objective }));
+          }
+          case 'pause':
+            if (!current) return `❌ 没有目标可暂停。\n${GOAL_USAGE}`;
+            return render('🎯 目标已暂停', svc.pause(agent, ref));
+          case 'resume':
+            if (!current) return `❌ 没有目标可恢复。\n${GOAL_USAGE}`;
+            return render('🎯 目标已恢复（自动续跑已武装）', svc.resume(agent, ref));
+          case 'clear':
+            if (!current) return '（没有可清除的目标）';
+            svc.clear(agent, ref);
+            return '🧹 目标已清除。';
+          default:
+            return GOAL_USAGE;
+        }
+      } catch (err) {
+        // GoalError carries a human-readable reason; show it.
+        return `❌ 目标操作失败：${err?.message ?? String(err)}\n${GOAL_USAGE}`;
+      }
+    }
+
+    // ---------------------------------------------------------------------
     // Per-chat model selection (mimics DSH's installModelSelection, inlined
     // so the plugin has no dependency on @deepseek-ai/dsh-agent internals).
     // A selection object {current, assembled} is wired into the agent's scoped
@@ -3188,6 +3412,8 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
               '• /model &lt;provider&gt;:&lt;model&gt; — 切换模型',
               '• /approval — 查看/管理「一直允许」授权（/approval clear 清空）',
               '• /autopilot — 全自动模式：全局写权限+自动放行授权+自动采纳推荐方案（on|off|status；⚠️ 有安全隐患）',
+              '• /plan [需求描述|off|status] — 计划模式：先只读出方案，方案经你审批后才执行',
+              '• /goal — 查看目标；/goal &lt;目标&gt; 设置长任务目标（edit/pause/resume/clear）',
               '• /help — 显示本帮助',
               '',
               '直接发普通消息即可对话。',
@@ -3205,6 +3431,10 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
             // session don't linger; a fresh board appears as the new session
             // spawns subagents.
             try { await teardownBoardForChat(botId, chatId); } catch { /* best-effort */ }
+            // Same for the pinned status board: the old session's goal/plan is
+            // gone, so unpin + delete; a fresh board appears when the new
+            // session sets a goal / enters plan mode.
+            try { await teardownStatusBoardForChat(botId, chatId); } catch { /* best-effort */ }
             const id = await createTelegramAgent(botId, chatId);
             chatAgents.set(k(botId, chatId), id);
             await reply(`✅ 已开启新会话 <code>${escapeHtml(fmtId(id))}</code>（完整 id 见 /sessions）。\n上下文已清空，后续消息路由到新会话。`);
@@ -3250,6 +3480,8 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
             if (!hit) { await reply(`❌ 未找到会话 <code>${escapeHtml(targetArg)}</code>。用 /sessions 查看。`); return true; }
             chatAgents.set(k(botId, chatId), String(hit.session.id));
             await reply(`✅ 已切换到会话 <code>${escapeHtml(hitShort)}</code>。`);
+            // The new session may have its own goal/plan — re-pin the status.
+            refreshStatusBoard(botId, chatId);
             return true;
           }
 
@@ -3410,6 +3642,7 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
                 return true;
               }
               disableAutopilot(botId, chatId, agent);
+              refreshStatusBoard(botId, chatId);
               await reply(`🛡️ 已关闭 autopilot（会话 <code>${escapeHtml(fmtId(agent?.session?.id))}</code>）。\n权限已恢复为 <code>${escapeHtml(s.prevSandbox ?? 'workspace-write')}</code> + 需审批，提问会重新等待你选择。`);
               return true;
             }
@@ -3424,6 +3657,7 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
               return true;
             }
             enableAutopilot(botId, chatId, agent);
+            refreshStatusBoard(botId, chatId);
             const short = fmtId(agent?.session?.id);
             // Explicit security warning (required by the feature spec).
             await reply([
@@ -3438,6 +3672,63 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
               '',
               `会话：<code>${escapeHtml(short)}</code>　停止：<code>/autopilot off</code>　中断任务：<code>/stop</code>`,
             ].join('\n'));
+            return true;
+          }
+
+          case '/plan': {
+            const arg = (args || '').trim();
+            const lower = arg.toLowerCase();
+            // status / 状态 — read current mode without changing it.
+            if (lower === 'status' || lower === 'state' || lower === '状态') {
+              const p = planStatusOf(active);
+              if (!p) { await reply('❌ plan 服务不可用（该部署未挂载 dsh-plan-mode）。'); return true; }
+              if (p.active) {
+                await reply(`🗺️ <b>计划模式：开启</b>${p.pending === false ? '\n退出中（下一步生效）。' : ''}\n只读调研 + 出方案；方案用 exit_plan_mode 提交给你审批，批准后才执行。退出：/plan off`);
+              } else {
+                await reply(`🗺️ 计划模式：关闭${p.pending === true ? '（进入中，下一步生效）' : ''}。进入：/plan [需求描述]`);
+              }
+              return true;
+            }
+            const wantOff = lower === 'off' || lower === 'disable' || lower === '0' || lower === '关闭';
+            const agent = active;
+            if (!agent) {
+              if (wantOff) { await reply('🗺️ 计划模式已经是关闭状态。'); return true; }
+              await reply('❌ 没有可用会话。请先 /new 新建会话，再 /plan。');
+              return true;
+            }
+            const outcome = setPlanModeFor(agent, !wantOff);
+            const outcomeText = {
+              committed: wantOff ? '🗺️ 已退出计划模式。' : '🗺️ 已进入计划模式：先只读调研并起草方案，方案会发给你审批（Approve / Keep planning）。退出：/plan off',
+              queued: `🗺️ ${wantOff ? '退出' : '进入'}计划模式（下一步生效）。`,
+              cancelled: wantOff ? '🗺️ 已取消进入计划模式（当前仍是关闭状态）。' : '🗺️ 已取消之前的退出请求（当前仍是开启状态）。',
+              noop: wantOff ? '🗺️ 计划模式已经是关闭状态。' : '🗺️ 计划模式已经是开启状态。',
+              appended: `🗺️ ${wantOff ? '已退出' : '已进入'}计划模式（会话直写，无 planMode 服务）。`,
+              unavailable: '❌ plan 服务不可用，且无法写入会话（该部署未挂载 dsh-plan-mode）。',
+            }[outcome] ?? `🗺️ 计划模式切换结果：${outcome}`;
+            await reply(outcomeText);
+            // Enter-with-request sugar (parity with web /plan <message>):
+            // also forward the description so the agent starts planning it.
+            if (!wantOff && arg && !['on', 'enable', '1'].includes(lower)) {
+              const body = {
+                role: 'user',
+                content: [{ type: 'text', text: `[Telegram /plan] 请针对以下需求进入计划模式并起草方案：\n${arg}` }],
+                source: { kind: messageSourceKind },
+                id: `telegram-plan-${Date.now()}`,
+              };
+              try {
+                if (typeof agent.followup === 'function') agent.followup(body);
+                else if (typeof agent.send === 'function') agent.send(body, 'next-turn', true);
+              } catch (err) {
+                log('warn', `/plan steer failed: ${err?.message ?? err}`);
+              }
+            }
+            refreshStatusBoard(botId, chatId);
+            return true;
+          }
+
+          case '/goal': {
+            await reply(escapeHtml(handleGoalCommand(active, args || '')));
+            refreshStatusBoard(botId, chatId);
             return true;
           }
 
@@ -3899,6 +4190,8 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
       { command: 'use', description: '切换到指定会话（/use <id>）' },
       { command: 'approval', description: '查看/管理「一直允许」授权（/approval clear 清空）' },
       { command: 'autopilot', description: '全自动模式：全局写权限+自动放行授权（/autopilot on|off|status）' },
+      { command: 'plan', description: '计划模式：先出方案再执行（/plan [需求|off|status]）' },
+      { command: 'goal', description: '长任务目标（/goal <目标> / pause / resume / clear）' },
       { command: 'help', description: '显示帮助' },
     ];
     for (const entry of botRegistry.values()) {
@@ -4080,6 +4373,15 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
       // nothing to restore on unload — just forget the map so a reload starts
       // clean.
       autopilotChats.clear();
+      // Status boards: unpin + delete every pinned status message, stop the
+      // refresh ticker, and empty the map so a reload starts clean.
+      try {
+        if (statusTicker) { clearInterval(statusTicker); statusTicker = null; }
+      } catch { /* ignore */ }
+      for (const b of statusBoards.values()) {
+        try { void b.teardown(); } catch { /* best-effort */ }
+      }
+      statusBoards.clear();
       log('info', 'Telegram plugin unloaded.');
     };
   });
