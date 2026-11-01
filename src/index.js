@@ -407,6 +407,38 @@ export async function resolveBotToken(configToken, ctx, envKey = 'TELEGRAM_BOT_T
 
 
 /**
+ * Render skill summaries (from the host `skills` service:
+ * {name, description, whenToUse, invocation, source}) as plain Telegram text
+ * for `/skills [filter]`. Kept pure + exported so it is unit-testable with
+ * fabricated summaries. `filter` matches name/description/whenToUse,
+ * case-insensitively. `max` caps listed rows (overflow collapses to a
+ * "+K more" line so the reply stays under Telegram's message limit).
+ */
+export function formatSkillCatalog(summaries, filter, max = 60) {
+  const all = Array.isArray(summaries) ? summaries : [];
+  const needle = String(filter ?? '').trim().toLowerCase();
+  const matched = needle
+    ? all.filter((s) => `${s?.name ?? ''} ${s?.description ?? ''} ${s?.whenToUse ?? ''}`.toLowerCase().includes(needle))
+    : all;
+  if (matched.length === 0) {
+    return needle
+      ? `（没有名字/描述含 “${filter}” 的 skill，共 ${all.length} 个）`
+      : '（当前没有可用 skill）';
+  }
+  const lines = [];
+  for (const s of matched.slice(0, max)) {
+    const desc = String(s?.description ?? s?.whenToUse ?? '').replace(/\s+/g, ' ').trim();
+    const clipped = desc.length > 100 ? `${desc.slice(0, 100)}…` : desc;
+    lines.push(`• ${s?.name ?? '?'}${clipped ? ` — ${clipped}` : ''}`);
+  }
+  if (matched.length > max) lines.push(`… 另有 ${matched.length - max} 个未列出（/skills <关键词> 过滤）`);
+  const head = needle
+    ? `可用 skill（匹配 ${matched.length}/${all.length}）：`
+    : `可用 skill（${all.length}）：`;
+  return `${head}\n\n${lines.join('\n')}\n\n发送消息即可让我加载并使用某个 skill。`;
+}
+
+/**
  * Extract the command (slash + name + args) from a message, preferring the
  * `bot_command` entity — the only signal that is guaranteed to be addressed
  * to THIS bot (and to handle the `@botusername` suffix in groups, e.g.
@@ -3414,6 +3446,7 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
               '• /autopilot — 全自动模式：全局写权限+自动放行授权+自动采纳推荐方案（on|off|status；⚠️ 有安全隐患）',
               '• /plan [需求描述|off|status] — 计划模式：先只读出方案，方案经你审批后才执行',
               '• /goal — 查看目标；/goal &lt;目标&gt; 设置长任务目标（edit/pause/resume/clear）',
+              '• /skills [关键词] — 列出当前会话可用的 skill（可按名称/描述过滤）',
               '• /help — 显示本帮助',
               '',
               '直接发普通消息即可对话。',
@@ -3729,6 +3762,28 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
           case '/goal': {
             await reply(escapeHtml(handleGoalCommand(active, args || '')));
             refreshStatusBoard(botId, chatId);
+            return true;
+          }
+
+          case '/skills': {
+            const skillsSvc = ctx.get?.('skills') ?? ctx.skills;
+            if (!skillsSvc?.list) {
+              await reply('❌ skill 服务不可用（该部署未挂载 dsh-skill）。');
+              return true;
+            }
+            // Same lookup the `skill` tool uses: the chat's agent scopes the
+            // layer chain, its session cwd selects project roots — so the
+            // list matches what that agent can actually load.
+            const cwd = active?.session?.header?.cwd ?? process.cwd();
+            let summaries;
+            try {
+              summaries = await skillsSvc.list({ cwd, scope: active ?? undefined });
+            } catch (err) {
+              log('warn', `skills.list failed: ${err?.message ?? err}`);
+              await reply(`❌ 读取 skill 列表失败：${escapeHtml(err?.message ?? String(err))}`);
+              return true;
+            }
+            await reply(escapeHtml(formatSkillCatalog(summaries, args || '')));
             return true;
           }
 
@@ -4192,6 +4247,7 @@ With multiple bots configured, pass the "bot" parameter to choose which bot send
       { command: 'autopilot', description: '全自动模式：全局写权限+自动放行授权（/autopilot on|off|status）' },
       { command: 'plan', description: '计划模式：先出方案再执行（/plan [需求|off|status]）' },
       { command: 'goal', description: '长任务目标（/goal <目标> / pause / resume / clear）' },
+      { command: 'skills', description: '列出可用 skill（/skills [关键词]）' },
       { command: 'help', description: '显示帮助' },
     ];
     for (const entry of botRegistry.values()) {

@@ -51,17 +51,28 @@ All notable changes to this project will be documented in this file.
     best-effort. Cleared on unload with the pinned messages unpinned.
   - Config: `statusBoardEnabled` (default `true`), `statusBoardPin`
     (default `true`), `statusBoardRefreshMs` (default `5000`).
-- `/help` and the BotFather command menu (`setMyCommands`) now list `/plan`
-  and `/goal`.
+- **`/skills [关键词]` — list the skills the chat's agent can load.** Reads
+  the host `skills` service (`dsh-skill`) with the same lookup the `skill`
+  tool uses (`cwd` from the agent's session header, `scope` = the agent), so
+  the reply matches what that agent can actually invoke — global +
+  project-root layers included. Optional filter matches name/description/
+  whenToUse case-insensitively; rows cap at 60 with a `+K more` overflow
+  line, descriptions clip at 100 chars. The agent loads one simply by being
+  asked in chat.
+- `/help` and the BotFather command menu (`setMyCommands`) now list `/plan`,
+  `/goal`, and `/skills`.
 
 ### Tests
+- `formatSkillCatalog` cases in `test/command-media.test.mjs` (7): no filter,
+  name/description/whenToUse matching, no-match + empty catalog, 100-char
+  clipping (and no clip under the limit), overflow collapse.
 - `test/statusboard.test.mjs` (21 cases): `/goal` grammar (show/create/edit/
   invalid-edit/pause/resume/clear, case-insensitivity), renderers (blocked
   reason, rounds, per-phase hints, long-objective clipping), snapshot
   meaningfulness, and the board lifecycle — first send+pin, unchanged = no-op,
   in-place edit without re-pin, re-post after external deletion, teardown on
   neutral, orphan deletion on teardown-during-send, pin failure and
-  `pinEnabled: false`. Full suite: 13 files, 348 pass.
+  `pinEnabled: false`. Full suite: 13 files, 355 pass.
 
 ## [0.6.5] - 2026-09-15
 

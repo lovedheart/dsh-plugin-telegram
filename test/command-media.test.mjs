@@ -3,7 +3,7 @@
 //   • sniffImageMediaType — magic-byte image type detection
 // Run: node test/command-media.test.mjs
 import { strict as assert } from 'node:assert';
-import { extractCommand, sniffImageMediaType } from '../src/index.js';
+import { extractCommand, sniffImageMediaType, formatSkillCatalog } from '../src/index.js';
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -84,6 +84,45 @@ test('short / unknown bytes -> null', () => {
   assert.equal(sniffImageMediaType([]), null);
   assert.equal(sniffImageMediaType(null), null);
   assert.equal(sniffImageMediaType(undefined), null);
+});
+
+console.log('\nformatSkillCatalog:');
+const SKILLS = [
+  { name: 'matlab-core', description: 'Build MATLAB apps.', invocation: { userInvocable: true, modelInvocable: true } },
+  { name: 'bili-say', description: 'B站AI原生助手。深度理解视频。', invocation: { userInvocable: true, modelInvocable: true } },
+  { name: 'ocr-code-review', whenToUse: 'Run AI code reviews.', invocation: { userInvocable: false, modelInvocable: true } },
+];
+test('no filter -> all listed with head count', () => {
+  const t = formatSkillCatalog(SKILLS, '');
+  assert.match(t, /可用 skill（3）：/);
+  assert.match(t, /^• matlab-core — Build MATLAB apps\.$/m);
+  assert.match(t, /^• ocr-code-review — Run AI code reviews\.$/m);
+});
+test('filter matches name, description and whenToUse (case-insensitive)', () => {
+  assert.match(formatSkillCatalog(SKILLS, 'MATLAB'), /匹配 1\/3/);
+  assert.match(formatSkillCatalog(SKILLS, 'ocr'), /• ocr-code-review/);
+  assert.match(formatSkillCatalog(SKILLS, 'B站'), /• bili-say/);
+});
+test('no match -> empty message keeps total', () => {
+  assert.match(formatSkillCatalog(SKILLS, 'zzz-nope'), /没有名字\/描述含 “zzz-nope” 的 skill，共 3 个/);
+});
+test('empty catalog', () => {
+  assert.match(formatSkillCatalog([], ''), /当前没有可用 skill/);
+  assert.match(formatSkillCatalog(null, ''), /当前没有可用 skill/);
+});
+test('long description clipped to 100 chars', () => {
+  const t = formatSkillCatalog([{ name: 'x', description: 'y'.repeat(300) }], '');
+  assert.match(t, /^• x — y{100}…$/m);
+});
+test('short description not clipped', () => {
+  const t = formatSkillCatalog([{ name: 'x', description: 'z'.repeat(50) }], '');
+  assert.match(t, /^• x — z{50}$/m);
+});
+test('overflow collapses into +K more line', () => {
+  const many = Array.from({ length: 70 }, (_, i) => ({ name: `s-${i}`, description: 'd' }));
+  const t = formatSkillCatalog(many, '');
+  assert.match(t, /另有 10 个未列出/);
+  assert.ok(t.split('\n').length <= 65, 'row cap holds the reply small');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
