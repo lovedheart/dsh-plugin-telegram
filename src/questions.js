@@ -35,6 +35,9 @@
 // side effect (telegram client, ownership, log) as deps.
 // ---------------------------------------------------------------------------
 
+import { isTransientTelegramError } from './client.js';
+
+
 /** Callback_data prefix. Bumped on any wire-format change (64-byte limit). */
 export const QUESTION_CALLBACK_PREFIX = 'tgq1:';
 
@@ -328,19 +331,31 @@ export function buildSummaryCard(entry, escape, settled = null, timeoutSec = 0) 
 }
 
 /**
- * Send via client.sendMessage, retrying Telegram rate limits (429 carries
- * retryAfter). Multi-question flows post several messages in a burst, which
- * can trip per-chat flood control. Non-rate-limit errors propagate at once.
+ * Send via client.sendMessage with delivery retries.
+ *  • 429 rate limits (retryAfter) — multi-question flows post several messages
+ *    in a burst, which can trip per-chat flood control.
+ *  • ANY transient transport error (v0.7.1): the api.telegram.org link on this
+ *    box intermittently hangs until the 60s client-side abort ("The operation
+ *    was aborted due to timeout"). Previously sendWithRetry only retried 429,
+ *    so ONE hung attempt delegated the whole ask to the web UI and the phone
+ *    card the user was looking at became inert — every tap answered "已过期".
+ *    Transient failures now retry up to 4 attempts with a light backoff.
+ * Permanent errors propagate immediately.
  */
-async function sendWithRetry(sendFn, log) {
+export async function sendWithRetry(sendFn, log, { isAbandoned } = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
       return await sendFn();
     } catch (err) {
+      if (isAbandoned?.()) return null;
       const retryAfter = Number(err?.retryAfter);
-      if (!(Number.isFinite(retryAfter) && retryAfter > 0) || attempt >= 3) throw err;
-      log?.('warn', `Telegram rate limited (${err.message}); retrying in ${retryAfter}s`);
-      await new Promise((r) => setTimeout(r, Math.min(retryAfter, 10) * 1000));
+      const rateLimited = Number.isFinite(retryAfter) && retryAfter > 0;
+      if (attempt >= 3 || !(rateLimited || isTransientTelegramError(err))) throw err;
+      const delayMs = rateLimited
+        ? Math.min(retryAfter, 10) * 1000
+        : 1000 * (attempt + 1);
+      log?.('warn', `Question card send attempt ${attempt + 1} failed (${err.message}); retrying in ${delayMs}ms`);
+      await new Promise((r) => setTimeout(r, delayMs));
     }
   }
 }
@@ -754,6 +769,10 @@ export function createQuestionModule(deps) {
   async function postQuestionCards(entry, next) {
     const subKey = (kb) => kb.map((row) =>
       row.map((b) => ({ ...b, callback_data: b.callback_data.replace('KEY', entry.key) })));
+    // A card the user could never see (ask already cancelled / aborted /
+    // delegated mid-retry) must NOT resurrect it: bail out of the retry loop
+    // and leave the entry settled.
+    const abandoned = () => Boolean(entry.outcome);
     const send = async (text, kb) => sendWithRetry(() => deps.client.sendMessage({
       chatId: entry.chatId,
       botId: entry.botId ?? undefined,
@@ -762,7 +781,7 @@ export function createQuestionModule(deps) {
       messageThreadId: entry.threadId,
       replyMarkup: { inline_keyboard: subKey(kb) },
       disableNotification: false,
-    }), deps.log);
+    }), deps.log, { isAbandoned: abandoned });
     try {
       // Autopilot (v0.5.0): when this (bot, chat) is in autopilot mode, auto-adopt
       // the recommended option and schedule the commit instead of waiting for a
@@ -794,6 +813,7 @@ export function createQuestionModule(deps) {
         const resS = await send(s.text, s.keyboard);
         entry.summaryMessageId = resS?.messageId ?? null;
       }
+      if (entry.outcome) return; // cancelled/aborted mid-retry — card intentionally left unseen
       deps.log?.('info', `Question card(s) posted for ${entry.sessionId || 'agent'} (chat ${entry.chatId}, ${entry.questions.length} question(s))`);
       // Auto-cancel after timeoutMs without a tap (0 = no cap).
       armTimeoutTimer(entry);

@@ -15,6 +15,7 @@ import {
   buttonsPerRow,
   effectiveMultiSelect,
   pickRecommended,
+  sendWithRetry,
 } from '../src/questions.js';
 
 let passed = 0, failed = 0;
@@ -797,5 +798,37 @@ await test('non-autopilot chat: isAutopilot false → normal interactive card (n
 });
 
 // ---------------------------------------------------------------------------
+// v0.7.1 regression: transient transport errors (the 60s client-side abort
+// "The operation was aborted due to timeout" on this box's flaky
+// api.telegram.org link) must RETRY the card send instead of delegating the
+// whole ask to the web UI — delegating left the phone card inert ("已过期"
+// on every tap). Direct unit test of sendWithRetry.
+console.log('\nsendWithRetry (v0.7.1 transient retry)');
+{
+  const abortErr = () => { const e = new Error('The operation was aborted due to timeout'); e.name = 'AbortError'; return e; };
+  await test('transient abort errors retry until success', async () => {
+    let n = 0;
+    const res = await sendWithRetry(async () => {
+      n++;
+      if (n < 3) throw abortErr();
+      return 'sent';
+    }, () => {});
+    assert.equal(res, 'sent');
+    assert.equal(n, 3, 'retried through two transient failures');
+  });
+  await test('permanent errors propagate immediately', async () => {
+    let n = 0;
+    await assert.rejects(sendWithRetry(async () => { n++; throw new Error('400 bad request'); }, () => {}));
+    assert.equal(n, 1, 'no retry on permanent failure');
+  });
+  await test('isAbandoned bails out of the retry loop', async () => {
+    let n = 0;
+    const res = await sendWithRetry(async () => { n++; throw abortErr(); }, () => {}, { isAbandoned: () => n >= 2 });
+    assert.equal(res, null, 'abandoned send returns null instead of throwing');
+    assert.equal(n, 2, 'stopped retrying once abandoned');
+  });
+}
+
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
