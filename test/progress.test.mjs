@@ -104,7 +104,14 @@ await test('tool call shown as 🔧 name：args', () => {
   assert.ok(text.includes('🔧 bash'));
   assert.ok(text.includes('ls -la /home'));
 });
-await test('block-end tool-call and tool/call dedupe by id (not shown twice)', () => {
+await test('tool line prefers the human description over raw args', () => {
+  const ind = new ProgressIndicator(makeOpts({ perBlockChars: 100 }));
+  ind.processEvent({ seq: 1, type: 'tool/call', data: { name: 'bash', arguments: { command: 'git status --porcelain', description: 'Show working tree status' }, callId: 'c1' } });
+  const text = ind.buildTraceText();
+  assert.ok(text.includes('🔧 bash · Show working tree status'), text);
+  assert.ok(!text.includes('git status'), `raw args must not leak: ${text}`);
+});
+await test('block-end tool-call dedupe by id (not shown twice)', () => {
   const ind = new ProgressIndicator(makeOpts());
   ind.processEvent({ seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{"command":"ls"}' } } } });
   ind.processEvent({ seq: 2, type: 'tool/call', data: { name: 'bash', arguments: '{"command":"ls"}', callId: 'c1' } });

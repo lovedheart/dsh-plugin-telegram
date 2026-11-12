@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.2] - 2026-11-12
+
+### Added
+- **Resizable subagent board.** The board's two truncation widths were
+  hard-coded (task name 26 columns, work line 74 columns), so on a desktop
+  Telegram client every row collapsed to a short fragment even when there was
+  room. New config: `subagentBoardMaxWorkWidth` (default **140**, up from the
+  fixed 74) and `subagentBoardMaxLabelWidth` (26), both in display columns
+  (CJK ≈ 2), clamped so `rows × (label + work)` stays inside `maxMessageLength`
+  — the flush only ever edits the FIRST chunk id, so a chunk-split board would
+  leave stale tails behind.
+- **Live wall-clock on working board rows.** A running subagent's line 1 now
+  ends with how long it has been up (`🟢 跑回归测试 · 工作中 · 3m12s`), ticking
+  in place because the board re-renders every `subagentBoardRefreshMs`. Terminal
+  rows keep their frozen total on line 2 (`已完成 · 用时 54s`) — never both.
+  New exported `formatElapsed(ms)` (`42s` / `3m12s` / `1h02m`) shared by both
+  renderers, replacing the ad-hoc terminal formatter (which padded nothing, so
+  `3m2s` looked ragged next to `3m12s`).
+
+### Changed
+- **Subagent board shows intent, not raw arguments.** Each working row used to
+  print the child's latest tool call as `name + raw args`
+  (`bash {"command":"git status --porcelain",...}`), which reads as noise.
+  DSH tools carry a human-facing `description` argument in active voice
+  ("Show working tree status") — the board now renders `name · description`
+  and only falls back to `name + args` for tools without a description
+  (`read`, `grep`, …) or when the caller omitted it. New pure helper
+  `describeToolCall(name, args)` in `src/subagents.js`, used by `latestActivity`
+  (which also accepts a `reason` argument as a secondary source).
+- **The in-turn progress trail follows the same rule.** `📜 运行轨迹` and the
+  streaming `最近活动` footer also printed `🔧 name：{raw json}`, so the intent was
+  buried. New `toolActivityLine(name, args, per)` in `src/progress.js` renders
+  `🔧 bash · Show working tree status`, with the same fallback. The shared
+  intent lookup lives in one place (`toolDescription` in `src/text.js`, tolerant
+  of both object and JSON-string `args`) so the board and the trail can never
+  drift apart again. Clamping is head-preserving here — `tailOf` keeps the END
+  of a string, which would have chopped the `🔧 name` prefix off.
+
+
 ## [0.7.0] - 2026-11-01
 
 ### Added

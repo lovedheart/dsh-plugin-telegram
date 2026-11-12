@@ -231,6 +231,8 @@ dsh web --patch ./cordis.yml
 | `subagentBoardRefreshMs` | number | `2000` | How often the board re-reads live child sessions and re-renders (edits are throttled to ~1.5 s regardless). |
 | `subagentBoardIncludeDescendants` | boolean | `false` | When `true`, also show nested subagents (a subagent that spawns another). Default shows only direct children. |
 | `subagentBoardMaxRows` | number | `10` | Cap on subagents shown before the overflow collapses into a `… 另有 K 个未显示` line (keeps the message under Telegram's 4096-char limit). |
+| `subagentBoardMaxWorkWidth` | number | `140` | Display columns (CJK ≈ 2) for line 2 — the "what it is doing right now" text. Desktop clients show ~76 latin columns, hence the roomy default; lower it (e.g. `74`) for phone-first reading. Clamped down so `rows × (work + label)` still fits one message (see `maxMessageLength`); a board that would split across messages leaves stale tails, because the board only ever edits its first chunk. |
+| `subagentBoardMaxLabelWidth` | number | `26` | Display columns for line 1's task name. Same clamp as above. |
 | `statusBoardEnabled` | boolean | `true` | Keep ONE pinned status message per chat showing plan mode / goal / autopilot (📌). It appears only while something is active and self-removes when everything is off. See "Pinned status board" below. |
 | `statusBoardPin` | boolean | `true` | Pin the status message at the chat top. |
 | `statusBoardRefreshMs` | number | `5000` | Ticker cadence that re-folds the snapshot (agent-side goal rounds / `exit_plan_mode` change state without a Telegram command). Unchanged text never re-edits. |
@@ -377,7 +379,10 @@ continuous "typing…" chat action. Modelled on QwenPaw's Telegram channel edit-
 streaming. Each recent item is one line:
 
 - `💭 <reasoning 片段>` — a chunk of the model's thinking (streamed as it happens);
-- `🔧 <tool>：<参数预览>` — a tool call (name + a compact argument preview).
+- `🔧 <tool> · <它在做什么>` — a tool call. DSH tools carry a human-facing
+  `description` argument in active voice ("Show working tree status"), so that is what
+  the line shows; tools without one (`read`, `grep`, …) or a caller that omitted it
+  fall back to `🔧 <tool>：<参数预览>`.
 
 The whole message is **tail-truncated to `progressMaxChars`**, so the **newest** items
 stay visible and the oldest scroll off (each line is separately capped at
@@ -398,19 +403,22 @@ occupies **at most two lines**:
 
 ```
 🧩 子代理看板 · 2 工作中 / 1 完成
-🟢 重构认证模块 · 工作中
-🔧 read src/auth/session.js
+🟢 重构认证模块 · 工作中 · 3m12s
+🔧 read · Read the session handling module
 🟢 跑集成测试 · 工作中
 正在启动…
 ✅ 整理依赖 · 已完成
 已完成 · 用时 42s
 ```
 
-- **Line 1** — status emoji + a short task name + status word (`工作中` / `已完成` / …).
+- **Line 1** — status emoji + a short task name + status word (`工作中` / `已完成` / …),
+  plus a live wall-clock while the row is still working (`· 3m12s`).
   The task name comes from the child's `subagent/descriptor` label (or the `subagent`
   tool call's `description`), truncated to fit.
 - **Line 2** — what it is doing **right now**: the child's most recent tool call
-  (`🔧 name + args`), else its latest reasoning, else `正在启动…` until activity appears.
+  (`🔧 name · description`, same intent-first rule as the progress trail), else its
+  latest reasoning, else `正在启动…` until activity appears. Terminal rows instead show
+  the frozen outcome + duration (`已完成 · 用时 42s`) — never both clocks.
 - **Real-time** — a ticker re-reads the live child sessions every
   `subagentBoardRefreshMs` (default 2 s) and edits the same message in place
   (edits are throttled to ~1.5 s so Telegram's edit rate limit is never hit).

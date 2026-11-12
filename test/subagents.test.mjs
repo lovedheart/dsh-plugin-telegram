@@ -12,6 +12,7 @@ import {
   labelFromDescription,
   latestActivity,
   renderBoardText,
+  formatElapsed,
   parentSubagentDescriptions,
 } from '../src/subagents.js';
 
@@ -105,6 +106,24 @@ await test('prefers most recent tool call', () => {
   assert.ok(a.startsWith('bash'), `got: ${a}`);
   assert.ok(a.includes('ls -la'));
 });
+await test('prefers the human description over raw args', () => {
+  const session = {
+    events: [
+      { seq: 1, type: 'tool/call', data: { name: 'bash', arguments: { command: 'git status --porcelain', description: 'Show working tree status' } } },
+    ],
+  };
+  assert.equal(latestActivity(session), 'bash · Show working tree status');
+});
+await test('falls back to raw args when no description', () => {
+  const session = {
+    events: [
+      { seq: 1, type: 'tool/call', data: { name: 'read', arguments: { file_path: 'src/a.js' } } },
+    ],
+  };
+  const a = latestActivity(session);
+  assert.ok(a.startsWith('read '), a);
+  assert.ok(a.includes('src/a.js'));
+});
 await test('falls back to reasoning', () => {
   const session = {
     events: [
@@ -166,6 +185,26 @@ await test('terminal row shows reason + elapsed', () => {
     { working: 0, done: 1, now: 16000, startWall: { a: 10000 } });
   assert.ok(t.includes('已完成'));
   assert.ok(t.includes('用时'));
+});
+await test('working row ticks a live wall-clock on line 1', () => {
+  const t = renderBoardText([entry('a', { label: 'task A' })],
+    { working: 1, done: 0, now: 75000, startWall: { a: 10000 } });
+  assert.ok(t.includes('task A · 工作中 · 1m05s'), t);
+});
+await test('working row omits the clock with no start time', () => {
+  const t = renderBoardText([entry('a', { label: 'task A', startedAt: 0 })], { working: 1, done: 0, now: 5000 });
+  assert.ok(!/工作中 · \d/.test(t), t);
+});
+await test('terminal row keeps elapsed at its end instant', () => {
+  const t = renderBoardText([entry('a', { status: 'completed', locked: true, endedAt: 16000 })],
+    { working: 0, done: 1, now: 90000, startWall: { a: 10000 } });
+  assert.ok(t.includes('用时 6s'), t);
+});
+await test('formatElapsed bucket shape', () => {
+  assert.equal(formatElapsed(42_400), '42s');
+  assert.equal(formatElapsed(192_000), '3m12s');
+  assert.equal(formatElapsed(3_720_000), '1h02m');
+  assert.equal(formatElapsed(undefined), '0s');
 });
 await test('maxRows collapses overflow into +K more', () => {
   const entries = ['a', 'b', 'c'].map((id) => entry(id, { label: id }));
