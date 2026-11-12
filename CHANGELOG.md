@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.4] - 2026-11-13
+
+### Added
+- **Project folder row on the 📌 status board** (`src/statusboard.js`,
+  `workspaceLabel`). Line under the header becomes `📁 qwentts.cpp` — the last
+  path segment of the session's `cwd`, so you can see from your phone which
+  project the agent is editing. Basename only (a full path wraps on a phone);
+  computed independently of `statusBoardGit`, so non-git workspaces show it
+  too. Like `gitLine` it rides along and never justifies pinning the board by
+  itself (`statusIsMeaningful` unchanged).
+
 ## [0.7.3] - 2026-11-13
 
 Four features aimed at driving a coding session from a phone. All additive;

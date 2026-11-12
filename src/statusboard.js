@@ -108,12 +108,25 @@ export function statusIsMeaningful(snapshot) {
 // Render the pinned status message (plain text — a goal objective may contain
 // raw < > & characters, so the board always sends/edits with no parse_mode).
 // Returns { text, meaningful }.
+// Last path segment of a workspace cwd, for the one-line 📁 row. Trailing
+// slashes stripped first so `/a/b/` reads `b`; root and empty stay as-is.
+export function workspaceLabel(cwd) {
+  const raw = String(cwd ?? '').trim();
+  const stripped = raw.replace(/[/\\]+$/, '');
+  if (!stripped) return raw.includes('/') ? '/' : '';
+  return stripped.split(/[/\\]/).filter(Boolean).pop() || stripped;
+}
+
 export function renderStatus(snapshot) {
   const plan = snapshot?.plan ?? {};
   const goal = snapshot?.goal ?? null;
   const lines = [];
   const sid = String(snapshot?.sessionId ?? '').trim();
   lines.push(`📌 会话状态${snapshot?.sessionShort ? ` <${snapshot.sessionShort}>` : ''}`);
+  // Which project folder this session is working in (basename only — a full
+  // path wraps on a phone). Like gitLine, it rides along and never justifies
+  // pinning the board by itself.
+  if (snapshot?.workspace) lines.push(`📁 ${snapshot.workspace}`);
   // Optional workspace git line (branch / dirty / ahead-behind). Rides along
   // when present; never decides whether the board exists (see
   // statusIsMeaningful) — a plain chat must still self-clean.

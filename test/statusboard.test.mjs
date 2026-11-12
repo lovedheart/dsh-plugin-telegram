@@ -4,7 +4,7 @@
 import { strict as assert } from 'node:assert';
 import {
   parseGoalCommand, formatGoalReport, goalHint, goalViewLine,
-  renderStatus, statusIsMeaningful, StatusBoard, GOAL_USAGE, phaseLabel,
+  renderStatus, statusIsMeaningful, StatusBoard, GOAL_USAGE, phaseLabel, workspaceLabel,
 } from '../src/statusboard.js';
 
 let passed = 0, failed = 0;
@@ -86,6 +86,23 @@ await test('git line renders under the header and justifies pinning', () => {
 await test('no git line -> board unchanged (non-git workspace)', () => {
   const { text } = renderStatus({ plan: { active: true }, gitLine: '' });
   assert.ok(!text.includes('🌿'));
+});
+
+console.log('\nworkspace folder row:');
+await test('workspace row shows the folder name under the header', () => {
+  const { text } = renderStatus({ plan: { active: false }, workspace: workspaceLabel('/home/me/sglang-fork-dev') });
+  const lines = text.split('\n');
+  assert.equal(lines[1], '📁 sglang-fork-dev');
+});
+await test('workspace label takes the last segment, ignores trailing slash', () => {
+  assert.equal(workspaceLabel('/home/me/Documents/'), 'Documents');
+  assert.equal(workspaceLabel(''), '');
+  assert.equal(workspaceLabel(undefined), '');
+  assert.equal(workspaceLabel('/'), '/');
+});
+await test('a folder name alone does not justify pinning the board', () => {
+  const { meaningful } = renderStatus({ plan: { active: false }, goal: null, autopilot: false, workspace: 'docs' });
+  assert.ok(!meaningful, 'workspace row rides along, never pins by itself');
 });
 
 console.log('\nStatusBoard lifecycle:');
