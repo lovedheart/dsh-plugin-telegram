@@ -8,6 +8,7 @@ import {
   statusEmoji,
   statusWord,
   normalizeStopReason,
+  numberedRows, formatSubagentList, formatSubagentDetail,
   labelFromSession,
   labelFromDescription,
   latestActivity,
@@ -396,6 +397,63 @@ await test('prune() drops terminal entries older than grace window', () => {
   b.onStart({ id: 'live' });
   b.prune(b.clock() + 40 * 60 * 1000);
   assert.equal(b.entries.has('live'), true, 'working entry kept');
+});
+
+console.log('/subagents rendering:');
+await test('numberedRows numbers working before done', () => {
+  const b = makeBoard();
+  b.onStart({ id: 'w1' });
+  b.onStart({ id: 'd1' });
+  b.onEnd({ id: 'd1', stopReason: 'completed' });
+  const rows = numberedRows(b);
+  assert.deepEqual(rows.map((r) => r.id), ['w1', 'd1']);
+  assert.deepEqual(rows.map((r) => r.n), [1, 2]);
+});
+await test('list counts, emoji and per-row work line', () => {
+  const b = makeBoard();
+  b.onStart({ id: 'w1' });
+  b.entries.get('w1').label = 'Fix login';
+  b.entries.get('w1').work = 'reading src/login.ts';
+  b.onStart({ id: 'd1' });
+  b.entries.get('d1').label = 'Add test';
+  b.onEnd({ id: 'd1', stopReason: 'completed' });
+  const t = formatSubagentList(numberedRows(b), { working: b.workingCount, done: b.doneCount, now: Date.now() });
+  assert.match(t, /子代理 2 个（1 工作中 \/ 1 完成）/);
+  assert.ok(t.includes('#1 🟢 Fix login · 工作中'), t);
+  assert.ok(t.includes('#2 ✅ Add test · 已完成'), t);
+  assert.ok(t.includes('reading src/login.ts'), 'work line shown');
+  assert.ok(t.includes('/subagents stop'), 'tells how to stop one');
+});
+await test('empty board explains how to get one', () => {
+  assert.match(formatSubagentList([]), /目前没有子代理/);
+});
+await test('list shows live elapsed for working rows only', () => {
+  const now = 10_000_000;
+  const rows = [
+    { n: 1, id: 'a', entry: { id: 'a', status: 'working', startedAt: now - 65_000, label: 'A' } },
+    { n: 2, id: 'b', entry: { id: 'b', status: 'completed', startedAt: now - 600_000, endedAt: now - 594_000, label: 'B' } },
+  ];
+  const t = formatSubagentList(rows, { working: 1, done: 1, now });
+  assert.ok(t.includes('1m05s'), t);   // live clock on the working row
+  assert.ok(t.includes('6s'), t);      // frozen duration on the finished row
+});
+await test('detail shows status, elapsed, work and stop hint', () => {
+  const now = 1_000_000;
+  const row = { n: 3, id: 'abc123', entry: { id: 'abc123', status: 'working', label: 'Audit deps', work: 'checking package.json', startedAt: now - 90_000 } };
+  const t = formatSubagentDetail(row, { now });
+  assert.match(t, /#3 🟢 Audit deps/);
+  assert.ok(t.includes('用时：1m30s（进行中）'), t);
+  assert.ok(t.includes('当前：checking package.json'), t);
+  assert.ok(t.includes('/subagents stop 3'), t);
+});
+await test('detail of a finished row has stop reason, no stop hint', () => {
+  const row = { n: 1, id: 'x', entry: { id: 'x', status: 'completed', stopReason: 'completed', startedAt: 0, endedAt: 60_000 } };
+  const t = formatSubagentDetail(row, { now: 999_000 });
+  assert.ok(t.includes('结束原因：completed'), t);
+  assert.ok(!t.includes('/subagents stop'), t);
+});
+await test('detail of a missing row is a hint, not a crash', () => {
+  assert.match(formatSubagentDetail(undefined), /没有这个编号/);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

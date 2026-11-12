@@ -76,6 +76,18 @@ await test('goal + autopilot lines', () => {
   assert.match(text, /Autopilot：开启/);
 });
 
+await test('git line renders under the header and justifies pinning', () => {
+  const { text, meaningful } = renderStatus({ plan: { active: false }, goal: null, autopilot: false, gitLine: '🌿 main · 2 未提交 · ↑7' });
+  assert.ok(meaningful, 'a git workspace alone justifies the board');
+  const lines = text.split('\n');
+  assert.equal(lines[0], '📌 会话状态');
+  assert.equal(lines[1], '🌿 main · 2 未提交 · ↑7');
+});
+await test('no git line -> board unchanged (non-git workspace)', () => {
+  const { text } = renderStatus({ plan: { active: true }, gitLine: '' });
+  assert.ok(!text.includes('🌿'));
+});
+
 console.log('\nStatusBoard lifecycle:');
 function fakeDeps() {
   const calls = [];

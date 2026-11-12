@@ -372,6 +372,41 @@ await test('stop() with no reply text just deletes the placeholder (no onFinalRe
   assert.equal(client.calls.deletes.length, 1, 'placeholder deleted');
 });
 
+console.log('\nonTurnComplete (test-failure notice hook):');
+await test('fires after a real turn/end, once, in streaming mode', async () => {
+  const events = [
+    { seq: 1, type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'answer' } } },
+    { seq: 2, type: 'turn/end', data: { kind: 'complete' } },
+  ];
+  const order = [];
+  const ind = new ProgressIndicator(makeOpts({
+    streaming: true,
+    agent: { session: { events } },
+    onFinalReply: async () => { order.push('reply'); return true; },
+    onTurnComplete: async () => { order.push('complete'); },
+  }));
+  ind.endedByTurnEnd = true; // stop() is normally reached via the tick that sets this
+  ind.msgId = 777;
+  ind.processEvent(events[0]); // the tick normally folds events before stop()
+  await ind.stop();
+  assert.deepEqual(order, ['reply', 'complete'], `notice must follow the reply: ${order}`);
+});
+await test('does not fire when the turn never ended (preempt/timeout)', async () => {
+  let fired = 0;
+  const ind = new ProgressIndicator(makeOpts({ onTurnComplete: () => { fired++; } }));
+  ind.msgId = 999;
+  await ind.stop(); // endedByTurnEnd stays unset → timeout/preempt path
+  assert.equal(fired, 0, 'no notice for a turn that never ended');
+});
+await test('a throwing notice never breaks stop() cleanup', async () => {
+  const client = makeClient();
+  const ind = new ProgressIndicator(makeOpts({ client, onTurnComplete: async () => { throw new Error('boom'); } }));
+  ind.endedByTurnEnd = true;
+  ind.msgId = 555;
+  await ind.stop();
+  assert.equal(client.calls.deletes.length, 1, 'placeholder still cleaned up');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
 })();

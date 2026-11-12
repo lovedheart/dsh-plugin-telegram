@@ -641,3 +641,72 @@ export class SubagentBoard {
     try { await this.deleteMessage?.(id); } catch { /* best-effort */ }
   }
 }
+
+// ---------------------------------------------------------------------------
+// /subagents command rendering (v0.7.2+).
+//
+// The pinned board is a glanceable dashboard; on a phone you also need to ask
+// "which one is stuck, and can I kill just that one?" — so the command lists
+// the same rows with a stable index (`#1`, `#2`…) that `stop` accepts, and can
+// show one row in full. Pure formatting here; the caller supplies the board +
+// live agents so this stays unit-testable.
+// ---------------------------------------------------------------------------
+
+/**
+ * Index board rows for `stop <n>`: working rows first (the ones you'd want to
+ * kill), then finished ones, matching the board's own ordering.
+ * @returns {Array<{n: number, id: string, entry: object}>}
+ */
+export function numberedRows(board) {
+  const entries = typeof board?.orderedEntries === 'function' ? board.orderedEntries() : [];
+  return entries.map((e, i) => ({ n: i + 1, id: String(e.id), entry: e }));
+}
+
+/**
+ * Plain-text listing for `/subagents` (the caller HTML-escapes).
+ * @param {Array} rows numberedRows() output
+ * @param {object} board the SubagentBoard (for counts)
+ */
+export function formatSubagentList(rows, opts = {}) {
+  const now = opts.now ?? Date.now();
+  if (!rows.length) return '这个会话目前没有子代理。让 agent 用 subagent / subagent_fork 派活后，这里就会列出。';
+  const lines = [`子代理 ${rows.length} 个（${opts.working ?? 0} 工作中 / ${opts.done ?? 0} 完成）`, ''];
+  for (const { n, entry } of rows) {
+    const word = statusWord(entry.status);
+    const start = opts.startWall?.get?.(entry.id) ?? entry.startedAt;
+    let time = '';
+    if (entry.status === 'working' && start && now >= start) time = ` · ${formatElapsed(now - start)}`;
+    else if (entry.status !== 'working' && start && entry.endedAt >= start) time = ` · ${formatElapsed(entry.endedAt - start)}`;
+    lines.push(`#${n} ${statusEmoji(entry.status)} ${truncateDisplay(entry.label || entry.id, 34)} · ${word}${time}`);
+    if (entry.status === 'working' && entry.work) {
+      lines.push(`   ${truncateDisplay(compact(entry.work), 90)}`);
+    }
+  }
+  lines.push('', '停止某一个：/subagents stop <编号>');
+  return lines.join('\n');
+}
+
+/**
+ * Full detail for one subagent (`/subagents <n>`): what it was asked to do and
+ * what it is doing now, with no truncation of the work line.
+ */
+export function formatSubagentDetail(row, opts = {}) {
+  if (!row) return '没有这个编号的子代理。发 /subagents 看列表。';
+  const e = row.entry;
+  const now = opts.now ?? Date.now();
+  const start = opts.startWall?.get?.(e.id) ?? e.startedAt;
+  const lines = [`#${row.n} ${statusEmoji(e.status)} ${e.label || e.id}`, `状态：${statusWord(e.status)}（${e.status}）`];
+  if (start) {
+    const end = e.status === 'working' ? now : (e.endedAt || now);
+    lines.push(`用时：${formatElapsed(Math.max(0, end - start))}${e.status === 'working' ? '（进行中）' : ''}`);
+  }
+  if (e.stopReason) lines.push(`结束原因：${e.stopReason}`);
+  if (e.work) lines.push(`当前：${compact(e.work)}`);
+  lines.push(`id：<code>${String(e.id).slice(0, 40)}</code>`);
+  if (e.status === 'working') lines.push(`停止：/subagents stop ${row.n}`);
+  return lines.join('\n');
+}
+
+function compact(s) {
+  return String(s ?? '').replace(/\s+/g, ' ').trim();
+}

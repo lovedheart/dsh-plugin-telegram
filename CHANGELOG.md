@@ -2,7 +2,64 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.7.2] - 2026-11-12
+## [0.7.3] - 2026-11-13
+
+Four features aimed at driving a coding session from a phone. All additive;
+every one is behind a config flag and the two that could spam a chat default to
+off or to only-fires-on-a-problem.
+
+### Added
+- **Git line on the 📌 status board** (`src/gitinfo.js`, `statusBoardGit`,
+  default **false**). Line 2 under the header becomes
+  `🌿 main · 2 已暂存 · 1 未提交 · 1 未跟踪 · ↑2 · ↓1`, read from
+  refresh), in-flight calls de-duplicated, 3s timeout, never throws.
+  `statusIsMeaningful` now also ORs `gitLine`, so a git repo alone justifies
+  pinning the board. Off by default because it would otherwise pin a board into
+  every web/academic chat; the coding profile opts in.
+- **Proactive test-failure notice** (`src/testreport.js`, `testFailureNotice`,
+  default on). When a turn ran a test suite and it failed, a separate
+  `🧪 测试失败：3 个（node:test）` message follows the reply with the failing
+  test names. On a phone you cannot watch a terminal, and "done" reads as
+  success unless the model happens to quote the failures. Detection pairs each
+  `tool/call` with its `tool/result` for shell-ish tools whose command looks
+  like a test run (npm/pnpm/yarn/bun test, `node --test`, npx jest|vitest|
+  mocha, pytest, cargo test, go test, make test, mvn/gradle/dotnet/rspec…); the
+  command decides, not the tool `description` (the model writes "Run the test
+  suite" for builds too). Failure counts parse node:test `# fail N`, jest
+  `Tests: … X failed`, pytest `FAILED path::test`, cargo, go, plus a bare
+  `N passed, M failed` counter (this repo's own reporters print exactly that).
+  Skipped when the agent's own reply already named the failures — deduped on
+  the failing test NAMES so prose + names never double-report.
+  `ProgressIndicator.onTurnComplete` is the hook: fires on every real
+  `turn/end` in BOTH response modes, after the reply has landed (preemption and
+  the timeout cap do not fire it).
+- **`/diff`** — review the agent's changes without a terminal
+  (`src/diffreport.js`). Prints `🔀 main ↔ HEAD`, `6 个文件 · +415 · −3 · 3 个
+  未跟踪新文件` and per-file stat lines, then uploads the full patch as a
+  `.patch` document. `/diff <branch|commit>` diffs against that ref (verified
+  with `rev-parse --verify` first), `/diff --staged` diffs the index. Untracked
+  files are included via `git diff --no-index /dev/null <path>` — otherwise
+  brand-new files, the ones most worth reviewing, silently vanish. No shell:
+  everything goes through `execFile` with an argv array. Patch capped at
+  900 KB (`diffMaxPatchBytes`) and cut on a line boundary WITH a visible
+  truncation note, because a silently cut diff is worse than no diff. Scope is
+  the agent's session cwd, not the plugin host's.
+- **`/subagents`** — the pinned board is a glance; this is the interrogation and
+  the per-child kill switch. Bare = numbered list (`#1 🟢 Fix login · 工作中 ·
+  1m05s` + its current work line); `/subagents <n>` = one child in full (status,
+  elapsed, work, id); `/subagents stop <n>` cancels ONLY that subagent via its
+  own `agent.cancel({ kind: 'user' })` — previously `/stop` was the only option
+  and it aborts the whole parent turn, including siblings. Numbering is stable
+  per chat because it matches the board's own ordering (working oldest-first,
+  then finished).
+
+### Changed
+- `/help` and the Telegram `/`-menu now list `/diff` and `/subagents`.
+- Suite: 366 → **422 passed, 0 failed** (new `test/gitinfo.test.mjs`,
+  `test/testreport.test.mjs`, `test/diffreport.test.mjs`, plus board/progress
+  cases). `npm test` chain extended with the three new files.
+
+
 
 ### Added
 - **Resizable subagent board.** The board's two truncation widths were
