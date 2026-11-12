@@ -47,6 +47,9 @@ Based on the Telegram channel implementation from [QwenPaw](https://github.com/Q
 | `/new` 或 `/clear` | 新建会话并路由过去（清空上下文；若当前会话在运行会先停止） |
 | `/sessions` | 列出活动会话（👉=当前，🏠=默认），`s-xxxx` 短 id + 状态 + 会话标题（长标题折两行） |
 | `/use <s-id>` | 切换到指定会话（支持 `s-xxxx` 短 id、hex 前缀、完整 id） |
+| `/cd` | 打开目录浏览卡片：列出当前目录的子目录 + 最近目录，点按钮进入，点 ✅ 才真正切换（浏览本身不改会话） |
+| `/cd <路径>` | 直接切换会话工作目录（绝对或相对路径，相对基于当前目录） |
+| `/cd1` … `/cd9` | 一键切回第 N 个最近用过的目录（说明文字就是该目录路径） |
 | `/stop` | 停止当前会话正在执行的任务 |
 | `/compact` | 压缩当前会话历史为摘要（走 DSH compaction 服务） |
 | `/history [n]` | 查看最近 n 条对话（默认 12） |

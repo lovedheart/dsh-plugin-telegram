@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.6] - 2026-11-13
+
+### Added
+- **`/cd` directory browsing** (new `src/cdnav.js`, wired in `src/index.js`).
+  A bare `/cd` now posts a tap-to-browse inline card instead of only echoing
+  the cwd: recent directories (🕘), the directory's subdirectories (📁, dotfiles
+  hidden, ≤30, numeric-aware sort), then ⬆️ 上级 / 🏠 主目录 / 📍 会话目录, and
+  ✅ 切换到这里 / ✖️ 关闭. Every navigation tap repaints the **same** message one
+  level deeper; only ✅ calls `workingDirectory.set`, so browsing never changes
+  the session. Committing reuses the exact same service call as `/cd <path>`
+  (durable `working-directory/change` event), refreshes the 📌 board, and drops
+  the keyboard from the committed card.
+- **`/cd1` … `/cd9` recent-directory shortcuts.** A persisted MRU list
+  (`$DSH_HOME/telegram-cd-recent.json`, cap 20, atomic write, corrupt-file
+  tolerant) is fed by every successful change — text form, card ✅, or
+  shortcut. The `setMyCommands` menu is now built from it, so typing `/cd` in a
+  Telegram client shows one row per recent directory naming the real path, and
+  `/cd3` jumps straight there. The menu is re-pushed (debounced 1.5 s) after a
+  change so the rows never go stale.
+- Why not real autocomplete: a Telegram client never streams the composer to
+  the bot — the server sees a message only after it is sent, so "press space →
+  completions" is not implementable for any bot. These two mechanisms are what
+  the platform does allow.
+
+### Fixed
+- `/help` and the command menu describe `/cd` as the browse card and document
+  `/cd1 … /cd9`.
+
+### Tests
+- `test/cdnav.test.mjs` (14): callback parse/64-byte cap, subdir filtering +
+  sort/cap, MRU dedupe + limit, card layout (fresh token per repaint, entry
+  index accounts for the recents block), browse-does-not-switch, repaint-in-place,
+  commit/close, cross-chat tap refused, expired/foreign callbacks ignored, a
+  failed commit keeps the card alive, store persistence + corrupt file.
+
 ## [0.7.5] - 2026-11-13
 
 ### Added
