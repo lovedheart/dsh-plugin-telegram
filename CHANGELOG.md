@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.5] - 2026-11-13
+
+### Added
+- **`/cd` command** (`src/index.js`). `/cd` shows the session's current
+  working directory; `/cd <path>` changes it. Backed by the host's
+  `workingDirectory` service (`@deepseek-ai/dsh-working-directory` — the same
+  one the web GUI's directory picker uses), so the change is a durable
+  `working-directory/change` session event the model sees in its system
+  prompt, not just a local string. Relative paths resolve against the
+  session's current directory; nonexistent paths get an error reply.
+  Registered in `/help` and the `setMyCommands` menu.
+- **Effective-cwd awareness**: new `effectiveCwd(agent)` helper prefers the
+  service's committed directory over `session.header.cwd`, and is used by the
+  status-board 📁 row + git line, `/diff`, and `/skills` — so those follow the
+  session after a `/cd` instead of showing the original project.
+
 ## [0.7.4] - 2026-11-13
 
 ### Added
